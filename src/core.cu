@@ -42,6 +42,8 @@
 //#include <solvers/jacobi_nocusp_solver.h>
 //#include <solvers/jacobi_solver.h>
 #include <solvers/jacobi_l1_solver.h>
+#include <solvers/spai_solver.h>
+#include <solvers/ilu_smoothers.h>
 #include <solvers/gauss_seidel_solver.h>
 #include <solvers/block_jacobi_solver.h>
 #include <solvers/cf_jacobi_solver.h>
@@ -379,9 +381,9 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("block_convert", "asks the reader to perform conversion to block matrix. <0>: do not perform conversion, <block_dim>: convert to (block_dim)x(block_dim) block matrix", 0);
     //Register Solver/Preconditioner/Smoother Parameters
     std::vector<std::string> solver_values = getAllSolvers();
-    AMG_Config::registerParameter<std::string>("solver", "the solving algorithm <AMG|PCG|PCGF|PBICGSTAB|GMRES|FGMRES|JACOBI_L1|BLOCK_JACOBI|GS|MULTICOLOR_GS|MULTICOLOR_ILU|MULTICOLOR_DILU|KACZMARZ|NOSOLVER>", "AMG", solver_values);
-    AMG_Config::registerParameter<std::string>("preconditioner", "the preconditioner algorithm <AMG|PCG|PCGF|PBICGSTAB|GMRES|FGMRES|JACOBI_L1|BLOCK_JACOBI|GS|MULTICOLOR_GS|MULTICOLOR_ILU|MULTICOLOR_DILU|NOSOLVER>", "AMG", solver_values);
-    AMG_Config::registerParameter<std::string>("coarse_solver", "the solving algorithm <AMG|PCG|PCGF|PBICGSTAB|GMRES|FGMRES|JACOBI_L1|BLOCK_JACOBI|GS|MULTICOLOR_GS|MULTICOLOR_ILU|MULTICOLOR_DILU|NOSOLVER>", "DENSE_LU_SOLVER", solver_values);
+    AMG_Config::registerParameter<std::string>("solver", "the solving algorithm <AMG|PCG|PCGF|PBICGSTAB|GMRES|FGMRES|JACOBI_L1|BLOCK_JACOBI|GS|MULTICOLOR_GS|MULTICOLOR_ILU|MULTICOLOR_DILU|SPAI0|SPAI1|ILUT|ILUP|KACZMARZ|NOSOLVER>", "AMG", solver_values);
+    AMG_Config::registerParameter<std::string>("preconditioner", "the preconditioner algorithm <AMG|PCG|PCGF|PBICGSTAB|GMRES|FGMRES|JACOBI_L1|BLOCK_JACOBI|GS|MULTICOLOR_GS|MULTICOLOR_ILU|MULTICOLOR_DILU|SPAI0|SPAI1|ILUT|ILUP|NOSOLVER>", "AMG", solver_values);
+    AMG_Config::registerParameter<std::string>("coarse_solver", "the solving algorithm <AMG|PCG|PCGF|PBICGSTAB|GMRES|FGMRES|JACOBI_L1|BLOCK_JACOBI|GS|MULTICOLOR_GS|MULTICOLOR_ILU|MULTICOLOR_DILU|SPAI0|SPAI1|ILUT|ILUP|NOSOLVER>", "DENSE_LU_SOLVER", solver_values);
     //AMG_Config::registerParameter< std::vector<std::string> >("smoother","the smoothing algorithm <BLOCK_JACOBI>",std::vector<std::string>(1, std::string("BLOCK_JACOBI")));
     AMG_Config::registerParameter<std::string>("smoother", "the smoothing algorithm <BLOCK_JACOBI>", "BLOCK_JACOBI", solver_values);
     //AMG_Config::registerParameter<std::string>("smoother_amg_list","list of smoothers that will be applied to the AMG hierarchy <BLOCK_JACOBI>","BLOCK_JACOBI", solver_values);
@@ -399,6 +401,17 @@ inline void registerParameters()
     AMG_Config::registerParameter<double>("relaxation_factor", "the relaxation factor used in a solver", 0.9, 0.0, 2.0);
     //Richardson's iteration - ILU
     AMG_Config::registerParameter<int>("ilu_sparsity_level", "The multicolor_ilu solver sparsity level. 0:ILU0, 1:ILU1, etc <0>", 0);
+    //Register ILUT/ILUP Parameters
+    AMG_Config::registerParameter<double>("ilut_drop_tol", "ILUT: drop factor entries not above ilut_drop_tol * sum_j |a_ij| / (off-diagonal entries of row i), as AMGCL tau", 1e-2, 0.0, 1.0);
+    AMG_Config::registerParameter<double>("ilut_fill_factor", "ILUT: keep at most ilut_fill_factor * nnz(lower/upper part of a_i) entries per factor row", 2.0, 0.0, 1e6);
+    AMG_Config::registerParameter<int>("ilup_fill_level", "ILUP: incomplete LU on the pattern of A^(ilup_fill_level+1), 0 is ILU(0)", 1, 0, 10);
+    AMG_Config::registerParameter<int>("ilu_factor_sweeps", "ILUT/ILUP: number of parallel fixed-point sweeps of the factorization", 5, 1, 1000);
+    std::vector<std::string> ilu_solve_values;
+    ilu_solve_values.push_back("JACOBI");
+    ilu_solve_values.push_back("CUSPARSE");
+    AMG_Config::registerParameter<std::string>("ilu_solve_method", "ILUT/ILUP: triangular solves with damped Jacobi iterations or exact cuSPARSE SpSV <JACOBI|CUSPARSE>", "JACOBI", ilu_solve_values);
+    AMG_Config::registerParameter<int>("ilu_solve_iters", "ILUT/ILUP: Jacobi iterations per triangular solve", 2, 0, 1000);
+    AMG_Config::registerParameter<double>("ilu_solve_damping", "ILUT/ILUP: damping of the Jacobi triangular solves", 0.72, 0.0, 2.0);
     //Richardson's iteration - GS
     AMG_Config::registerParameter<int>("symmetric_GS", "Flag to control if GS smoother is symmetric or not <0|1>", 0);
     AMG_Config::registerParameter<int>("jacobi_iters", "the inner iterations for GSINNER", 5);
@@ -619,6 +632,10 @@ struct registerClasses<T_Config, false>
         //Preconditioners
         SolverFactory<T_Config>::registerFactory("BLOCK_JACOBI", new block_jacobi_solver::BlockJacobiSolverFactory<T_Config>);
         SolverFactory<T_Config>::registerFactory("JACOBI_L1", new JacobiL1SolverFactory<T_Config>);
+        SolverFactory<T_Config>::registerFactory("SPAI0", new SPAI0SolverFactory<T_Config>);
+        SolverFactory<T_Config>::registerFactory("SPAI1", new SPAI1SolverFactory<T_Config>);
+        SolverFactory<T_Config>::registerFactory("ILUT", new ILUTSolverFactory<T_Config>);
+        SolverFactory<T_Config>::registerFactory("ILUP", new ILUPSolverFactory<T_Config>);
         SolverFactory<T_Config>::registerFactory("CF_JACOBI", new cf_jacobi_solver::CFJacobiSolverFactory<T_Config>);
         SolverFactory<T_Config>::registerFactory("GS", new GaussSeidelSolverFactory<T_Config>);
         SolverFactory<T_Config>::registerFactory("FIXCOLOR_GS", new fixcolor_gauss_seidel_solver::FixcolorGaussSeidelSolverFactory<T_Config>); //not exposed
