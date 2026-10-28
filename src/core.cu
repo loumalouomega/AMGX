@@ -59,6 +59,9 @@
 #include <solvers/dense_lu_solver.h>
 #include <solvers/kaczmarz_solver.h>
 #include <solvers/chebyshev_poly.h>
+#include <solvers/cpr_solver.h>
+#include <solvers/schur_solver.h>
+#include <solvers/deflation_solver.h>
 
 #include <convergence/absolute.h>
 #include <convergence/relative_max.h>
@@ -395,6 +398,24 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("gmres_n_restart", "the number of Krylov vectors used in FGMRES or GMRES solver ", 20);
     AMG_Config::registerParameter<int>("bicgstab_l", "BICGSTABL: degree L of the minimal residual polynomial of BiCGStab(L)", 2, 1, 8);
     AMG_Config::registerParameter<int>("lgmres_augmentation_k", "LGMRES: number of previous corrections that augment each restart cycle (gmres_n_restart is the total basis size)", 3, 0, 20);
+    //Composite preconditioners
+    AMG_Config::registerParameter<std::string>("cpr_pressure_solver", "CPR: solver of the pressure system (as AMGCL pprecond)", "AMG", solver_values);
+    AMG_Config::registerParameter<std::string>("cpr_global_smoother", "CPR: global smoother applied to the full system before the pressure correction (as AMGCL sprecond)", "MULTICOLOR_DILU", solver_values);
+    AMG_Config::registerParameter<int>("cpr_block_dim", "CPR: unknowns per cell of a scalar matrix, pressure first (BSR matrices use their block dimension)", 3, 1, 8);
+    std::vector<std::string> cpr_decoupling_values;
+    cpr_decoupling_values.push_back("DRS");
+    cpr_decoupling_values.push_back("QUASI_IMPES");
+    AMG_Config::registerParameter<std::string>("cpr_decoupling", "CPR: pressure restriction weights, dynamic row sum (AMGCL cpr_drs) or quasi-IMPES (AMGCL cpr) <DRS|QUASI_IMPES>", "DRS", cpr_decoupling_values);
+    AMG_Config::registerParameter<double>("cpr_diag_dominant_tol", "CPR-DRS: equation k > 0 is dropped from the pressure row when a_kk(pressure) < cpr_diag_dominant_tol * sum of its off-diagonal pressure couplings (AMGCL eps_dd)", 0.2, 0.0, 1e6);
+    AMG_Config::registerParameter<double>("cpr_pressure_coupling_tol", "CPR-DRS: equation k > 0 is dropped when the pressure equation couples to unknown k by less than cpr_pressure_coupling_tol * |a_pp| (AMGCL eps_ps)", 0.02, 0.0, 1e6);
+    AMG_Config::registerParameter<std::string>("cpr_drs_weights", "CPR-DRS: comma-separated weight of each equation of a cell in the pressure row, empty for 1 (AMGCL weights, per cell component)", "");
+    AMG_Config::registerParameter<std::string>("schur_velocity_solver", "Schur pressure correction: solver of the velocity block Kuu (AMGCL usolver)", "AMG", solver_values);
+    AMG_Config::registerParameter<std::string>("schur_pressure_solver", "Schur pressure correction: solver of the assembled pressure matrix (AMGCL psolver)", "AMG", solver_values);
+    AMG_Config::registerParameter<std::string>("schur_pmask_pattern", "Schur pressure correction: pressure unknowns when no row markers are set, AMGCL %start:stride, >start or <end (JSON), or stride.START.STRIDE, tail.START, head.END", "");
+    AMG_Config::registerParameter<int>("schur_variant", "Schur pressure correction: 1 pressure correction (U, P, U), 2 block triangular (P, U) (AMGCL type)", 1, 1, 2);
+    AMG_Config::registerParameter<int>("schur_adjust_p", "Schur pressure correction: pressure matrix Kpp (0), Kpp - diag(Kpu M Kup) (1), Kpp - Kpu M Kup (2) (AMGCL adjust_p)", 2, 0, 2);
+    AMG_Config::registerParameter<int>("schur_simplec_dia", "Schur pressure correction: M = 1 / sum_j |Kuu_ij| (1, SIMPLEC) or diag(Kuu)^-1 (0) (AMGCL simplec_dia)", 1, 0, 1);
+    AMG_Config::registerParameter<int>("deflation_use_nullspace", "DEFLATION: deflate the near-nullspace of AMGX_matrix_set_nullspace instead of AMGX_matrix_set_deflation_vectors", 0, 0, 1);
     AMG_Config::registerParameter<int>("gmres_krylov_dim", "maximum size fo the krylov subspace. Can be smaller than restart, in that case the algorithm minimizes the quasi residual (QGMRES). Set to zero to automatically match the restart <0>", 0);
     //IDR
     AMG_Config::registerParameter<int>("subspace_dim_s", "the number of dimensions of the small system ", 8);
@@ -633,6 +654,10 @@ struct registerClasses<T_Config, false>
         SolverFactory<T_Config>::registerFactory("LGMRES", new LGMRES_SolverFactory<T_Config>);
         SolverFactory<T_Config>::registerFactory("BICGSTABL", new BiCGStabL_SolverFactory<T_Config>);
         SolverFactory<T_Config>::registerFactory("FGMRES", new FGMRES_SolverFactory<T_Config>);
+        //Composite preconditioners
+        SolverFactory<T_Config>::registerFactory("CPR", new CPR_SolverFactory<T_Config>);
+        SolverFactory<T_Config>::registerFactory("SCHUR_PRESSURE_CORRECTION", new SchurPressureCorrection_SolverFactory<T_Config>);
+        SolverFactory<T_Config>::registerFactory("DEFLATION", new Deflation_SolverFactory<T_Config>);
         SolverFactory<T_Config>::registerFactory("IDR", new idr_solver::IDR_SolverFactory<T_Config>); //not exposed
         SolverFactory<T_Config>::registerFactory("IDRMSYNC", new idrmsync_solver::IDRMSYNC_SolverFactory<T_Config>); //not exposed
         //Chebyshev iteration

@@ -3935,6 +3935,90 @@ extern "C" {
         return AMGX_RC_OK;
     }
 
+    AMGX_RC AMGX_API AMGX_matrix_set_row_markers(AMGX_matrix_handle mtx, int n, const int *markers)
+    {
+        nvtxRange nvrf(__func__);
+
+        Resources *resources = NULL;
+        AMGX_CHECK_API_ERROR_NORSRC(getAMGXerror(getResourcesFromMatrixHandle(mtx, &resources)))
+        AMGX_ERROR rc = AMGX_OK;
+
+        AMGX_TRIES()
+        {
+            if (n < 0 || (n > 0 && markers == NULL))
+            {
+                FatalError("AMGX_matrix_set_row_markers: invalid markers", AMGX_ERR_BAD_PARAMETERS);
+            }
+
+            AMGX_Mode mode = get_mode_from(mtx);
+
+            switch (mode)
+            {
+#define AMGX_CASE_LINE(CASE) case CASE: { \
+        Matrix<typename TemplateMode<CASE>::Type> *mtx_ptr = get_mode_object_from<CASE,Matrix,AMGX_matrix_handle>(mtx); \
+        if (n > 0 && (size_t) n != (size_t) mtx_ptr->get_num_rows() * mtx_ptr->get_block_dimy()) \
+        { \
+            FatalError("AMGX_matrix_set_row_markers: n must be num_rows * block_dimy", AMGX_ERR_BAD_PARAMETERS); \
+        } \
+        mtx_ptr->m_row_markers.assign(markers, markers + n); \
+    } \
+    break;
+                    AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+                    AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+                default:
+                    AMGX_CHECK_API_ERROR(AMGX_ERR_BAD_MODE, resources)
+            }
+        }
+
+        AMGX_CATCHES(rc)
+        AMGX_CHECK_API_ERROR(rc, resources)
+        return AMGX_RC_OK;
+    }
+
+    AMGX_RC AMGX_API AMGX_matrix_set_deflation_vectors(AMGX_matrix_handle mtx, int num_vectors, const double *const *vectors)
+    {
+        nvtxRange nvrf(__func__);
+
+        Resources *resources = NULL;
+        AMGX_CHECK_API_ERROR_NORSRC(getAMGXerror(getResourcesFromMatrixHandle(mtx, &resources)))
+        AMGX_ERROR rc = AMGX_OK;
+
+        AMGX_TRIES()
+        {
+            if (num_vectors < 0 || (num_vectors > 0 && vectors == NULL))
+            {
+                FatalError("AMGX_matrix_set_deflation_vectors: invalid deflation vectors", AMGX_ERR_BAD_PARAMETERS);
+            }
+
+            AMGX_Mode mode = get_mode_from(mtx);
+
+            switch (mode)
+            {
+#define AMGX_CASE_LINE(CASE) case CASE: { \
+        Matrix<typename TemplateMode<CASE>::Type> *mtx_ptr = get_mode_object_from<CASE,Matrix,AMGX_matrix_handle>(mtx); \
+        const size_t n = (size_t) mtx_ptr->get_num_rows() * mtx_ptr->get_block_dimy(); \
+        mtx_ptr->m_deflation.resize(n * num_vectors); \
+        mtx_ptr->m_deflation_cols = num_vectors; \
+        for (int k = 0; k < num_vectors; k++) \
+            std::copy(vectors[k], vectors[k] + n, mtx_ptr->m_deflation.begin() + k * n); \
+    } \
+    break;
+                    AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+                    AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+                default:
+                    AMGX_CHECK_API_ERROR(AMGX_ERR_BAD_MODE, resources)
+            }
+        }
+
+        AMGX_CATCHES(rc)
+        AMGX_CHECK_API_ERROR(rc, resources)
+        return AMGX_RC_OK;
+    }
+
     AMGX_RC AMGX_API AMGX_generate_rigid_body_modes(int ndim, int num_nodes, const double *coords, double *modes)
     {
         nvtxRange nvrf(__func__);

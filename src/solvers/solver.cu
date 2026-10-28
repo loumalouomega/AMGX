@@ -1107,10 +1107,15 @@ Solver<TConfig> *SolverFactory<TConfig>::allocate(AMG_Config &cfg,
 
     if ( (solverType == "coarse_solver" ||
             solverType == "smoother" ||
-            solverType == "preconditioner") &&
+            solverType == "preconditioner" ||
+            solverType == "cpr_pressure_solver" ||
+            solverType == "cpr_global_smoother" ||
+            solverType == "schur_velocity_solver" ||
+            solverType == "schur_pressure_solver") &&
             (solverName == "AMG" || solverName == "FGMRES" ||
              solverName == "PCGF" || solverName == "PBICGSTAB" ||
-             solverName == "PCG") &&
+             solverName == "PCG" || solverName == "CPR" ||
+             solverName == "SCHUR_PRESSURE_CORRECTION" || solverName == "DEFLATION") &&
             new_scope == "default")
     {
         std::string error = "Solver " + solverName

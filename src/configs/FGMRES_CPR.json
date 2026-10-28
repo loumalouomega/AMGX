@@ -1,0 +1,57 @@
+{
+    "config_version": 2, 
+    "solver": {
+        "preconditioner": {
+            "solver": "CPR", 
+            "scope": "cpr", 
+            "cpr_block_dim": 2, 
+            "cpr_decoupling": "DRS", 
+            "cpr_diag_dominant_tol": 0.2, 
+            "cpr_pressure_coupling_tol": 0.02, 
+            "cpr_pressure_solver": {
+                "solver": "AMG", 
+                "scope": "pressure", 
+                "algorithm": "CLASSICAL", 
+                "selector": "PMIS", 
+                "interpolator": "D2", 
+                "strength_threshold": 0.25, 
+                "smoother": {
+                    "solver": "BLOCK_JACOBI", 
+                    "scope": "pressure_jacobi", 
+                    "relaxation_factor": 0.8, 
+                    "monitor_residual": 0, 
+                    "print_solve_stats": 0
+                }, 
+                "presweeps": 1, 
+                "postsweeps": 1, 
+                "max_levels": 20, 
+                "max_iters": 1, 
+                "monitor_residual": 0, 
+                "print_solve_stats": 0
+            }, 
+            "cpr_global_smoother": {
+                "solver": "ILUP", 
+                "scope": "global_ilu", 
+                "ilup_fill_level": 0, 
+                "ilu_factor_sweeps": 30, 
+                "ilu_solve_method": "CUSPARSE", 
+                "max_iters": 1, 
+                "monitor_residual": 0, 
+                "print_solve_stats": 0
+            }, 
+            "max_iters": 1, 
+            "monitor_residual": 0, 
+            "print_solve_stats": 0
+        }, 
+        "solver": "FGMRES", 
+        "gmres_n_restart": 50, 
+        "print_solve_stats": 1, 
+        "obtain_timings": 1, 
+        "max_iters": 500, 
+        "monitor_residual": 1, 
+        "convergence": "RELATIVE_INI_CORE", 
+        "scope": "main", 
+        "tolerance": 1e-06, 
+        "norm": "L2"
+    }
+}

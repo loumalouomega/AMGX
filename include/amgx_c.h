@@ -303,6 +303,20 @@ AMGX_RC AMGX_API AMGX_matrix_set_nullspace
  int num_vectors,
  const double *const *vectors);
 
+/* Per-unknown markers for SCHUR_PRESSURE_CORRECTION: markers[i] != 0 marks scalar unknown i
+   (of n == num_rows*block_dimy) as pressure. n == 0 clears the markers. Call after upload. */
+AMGX_RC AMGX_API AMGX_matrix_set_row_markers
+(AMGX_matrix_handle mtx,
+ int n,
+ const int *markers);
+
+/* Deflation vectors for DEFLATION. vectors[k] holds n*block_dimy values; num_vectors == 0
+   clears them. Call after the matrix has been uploaded. */
+AMGX_RC AMGX_API AMGX_matrix_set_deflation_vectors
+(AMGX_matrix_handle mtx,
+ int num_vectors,
+ const double *const *vectors);
+
 /* Orthonormal rigid body modes of a 2D (3 modes) or 3D (6 modes) elasticity problem with
    ndim interleaved displacement dofs per node. coords holds num_nodes*ndim coordinates,
    mode k is written to modes[k * num_nodes * ndim, (k + 1) * num_nodes * ndim). */

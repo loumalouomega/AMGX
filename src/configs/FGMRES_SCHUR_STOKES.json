@@ -1,0 +1,51 @@
+{
+    "config_version": 2, 
+    "solver": {
+        "preconditioner": {
+            "solver": "SCHUR_PRESSURE_CORRECTION", 
+            "scope": "schur", 
+            "schur_variant": 1, 
+            "schur_adjust_p": 1, 
+            "schur_simplec_dia": 1, 
+            "schur_velocity_solver": {
+                "solver": "AMG", 
+                "scope": "velocity", 
+                "algorithm": "SMOOTHED_AGGREGATION", 
+                "smoother": {
+                    "solver": "SPAI0", 
+                    "scope": "velocity_spai0", 
+                    "relaxation_factor": 1.0, 
+                    "monitor_residual": 0, 
+                    "print_solve_stats": 0
+                }, 
+                "presweeps": 1, 
+                "postsweeps": 1, 
+                "max_levels": 20, 
+                "max_iters": 1, 
+                "monitor_residual": 0, 
+                "print_solve_stats": 0
+            }, 
+            "schur_pressure_solver": {
+                "solver": "BLOCK_JACOBI", 
+                "scope": "pressure", 
+                "relaxation_factor": 1.0, 
+                "max_iters": 1, 
+                "monitor_residual": 0, 
+                "print_solve_stats": 0
+            }, 
+            "max_iters": 1, 
+            "monitor_residual": 0, 
+            "print_solve_stats": 0
+        }, 
+        "solver": "FGMRES", 
+        "gmres_n_restart": 50, 
+        "print_solve_stats": 1, 
+        "obtain_timings": 1, 
+        "max_iters": 300, 
+        "monitor_residual": 1, 
+        "convergence": "RELATIVE_INI_CORE", 
+        "scope": "main", 
+        "tolerance": 1e-06, 
+        "norm": "L2"
+    }
+}

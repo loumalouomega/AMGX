@@ -1413,6 +1413,10 @@ AMG_Config::AMG_Config() : ref_count(1), m_latest_config_version(2), m_config_ve
     m_solver_list.push_back("coarse_solver");
     m_solver_list.push_back("cpr_first_stage_preconditioner");
     m_solver_list.push_back("cpr_second_stage_preconditioner");
+    m_solver_list.push_back("cpr_pressure_solver");
+    m_solver_list.push_back("cpr_global_smoother");
+    m_solver_list.push_back("schur_velocity_solver");
+    m_solver_list.push_back("schur_pressure_solver");
 }
 
 void AMG_Config::clear()

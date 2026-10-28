@@ -830,6 +830,15 @@ class MatrixBase : public AuxData, public Operator<T_Config>
            (num_rows*block_dimy) x m_nullspace_cols, set with AMGX_matrix_set_nullspace */
         std::vector<double> m_nullspace;
         int m_nullspace_cols = 0;
+
+        /* Per scalar unknown markers (nonzero: pressure) for the Schur pressure correction,
+           set with AMGX_matrix_set_row_markers */
+        std::vector<int> m_row_markers;
+
+        /* Deflation vectors, column-major (num_rows*block_dimy) x m_deflation_cols, set with
+           AMGX_matrix_set_deflation_vectors */
+        std::vector<double> m_deflation;
+        int m_deflation_cols = 0;
 #ifdef DEBUG
         IVector diag_copy;        //size: num_rows*block_size
 #endif

@@ -1,0 +1,40 @@
+{
+    "config_version": 2, 
+    "solver": {
+        "preconditioner": {
+            "solver": "DEFLATION", 
+            "scope": "deflation", 
+            "deflation_use_nullspace": 0, 
+            "preconditioner": {
+                "solver": "AMG", 
+                "scope": "amg", 
+                "algorithm": "SMOOTHED_AGGREGATION", 
+                "smoother": {
+                    "solver": "SPAI0", 
+                    "scope": "spai0", 
+                    "relaxation_factor": 1.0, 
+                    "monitor_residual": 0, 
+                    "print_solve_stats": 0
+                }, 
+                "presweeps": 1, 
+                "postsweeps": 1, 
+                "max_levels": 20, 
+                "max_iters": 1, 
+                "monitor_residual": 0, 
+                "print_solve_stats": 0
+            }, 
+            "max_iters": 1, 
+            "monitor_residual": 0, 
+            "print_solve_stats": 0
+        }, 
+        "solver": "PCG", 
+        "print_solve_stats": 1, 
+        "obtain_timings": 1, 
+        "max_iters": 500, 
+        "monitor_residual": 1, 
+        "convergence": "RELATIVE_INI_CORE", 
+        "scope": "main", 
+        "tolerance": 1e-06, 
+        "norm": "L2"
+    }
+}
