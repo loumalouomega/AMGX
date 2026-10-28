@@ -492,6 +492,7 @@ void CSR_Multiply_Impl<TemplateConfig<AMGX_device, V, M, I> >::multiply( const M
     thrust_wrapper::sequence<AMGX_device>(C.m_seq_offsets.begin(), C.m_seq_offsets.end());
     cudaCheckError();
     bool done = false;
+    nvtxRange *symbolic_nr = new nvtxRange("spgemm_symbolic");
 
     try
     {
@@ -528,6 +529,8 @@ void CSR_Multiply_Impl<TemplateConfig<AMGX_device, V, M, I> >::multiply( const M
     // We have to fallback to the CUSPARSE path.
     if ( !done )
     {
+        delete symbolic_nr;
+        symbolic_nr = NULL;
         this->cusparse_multiply(A,B,C,Aq1,Bq1,Aq2,Bq2);
     }
 
@@ -544,6 +547,9 @@ void CSR_Multiply_Impl<TemplateConfig<AMGX_device, V, M, I> >::multiply( const M
        C.set_block_dimx(A.get_block_dimx());
        C.set_block_dimy(B.get_block_dimy());
        C.setColsReorderedByColor(false);
+       delete symbolic_nr;
+       symbolic_nr = NULL;
+       nvtxRange numeric_nr("spgemm_numeric");
        // Like count_non_zeroes, compute_values is responsible for setting its work queue (if it dares :)).
        done = false;
 

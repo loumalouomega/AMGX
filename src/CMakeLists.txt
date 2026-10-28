@@ -15,7 +15,7 @@ target_include_directories(amgx_libs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../inclu
 
 set(AMGX_INCLUDES ../include)
 
-set(tests_all ${tests_all} testframework.cu test_utils.cu unit_test.cu tests/smoothed_aggregation.cu tests/smoothers_p1.cu tests/krylov_p2.cu tests/composite_p3.cu)
+set(tests_all ${tests_all} testframework.cu test_utils.cu unit_test.cu tests/smoothed_aggregation.cu tests/smoothers_p1.cu tests/krylov_p2.cu tests/composite_p3.cu tests/reorder_rebuild_p5.cu)
 
 add_library(amgx_tests_libs OBJECT ${tests_all})
 

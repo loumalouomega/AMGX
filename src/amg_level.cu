@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <amg_level.h>
+#include <amgx_timer.h>
 #include <basic_types.h>
 #include <blas.h>
 #include <types.h>
@@ -90,6 +91,7 @@ template <class T_Config>
 void AMG_Level<T_Config>::setup_smoother()
 {
     typedef typename TConfig::MemSpace MemorySpace;
+    nvtxRange smoother_nr("smoother_setup");
     (*this).Profile.tic("SmootherIni");
     // Initialize the smoother
     /*if( this->smoother != NULL )

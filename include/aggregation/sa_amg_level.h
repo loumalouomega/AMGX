@@ -18,6 +18,7 @@ template <class T_Config> class SA_AMG_Level;
 
 #include <basic_types.h>
 #include <amg_level.h>
+#include <numeric_galerkin.h>
 #include <matrix.h>
 
 namespace amgx
@@ -105,6 +106,7 @@ class SA_AMG_Level_Base : public AMG_Level<T_Config>
 
         Matrix<TConfig> P, R;
         Matrix<TConfig> m_A_scalar;
+        NumericGalerkin<TConfig> m_galerkin;   // numeric-only Galerkin product on structure-reuse levels
         bool m_use_scalar_copy;
         int m_block_size;
         int m_inherited_block_size;

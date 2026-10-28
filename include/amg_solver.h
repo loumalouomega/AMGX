@@ -39,6 +39,7 @@ namespace amgx
 {
 
 template <class T_Config> class AMG_Solver;
+template <class T_Config> struct ReorderedSystem;
 template <class T_Config> class Solver;
 
 AMGX_ERROR initialize();
@@ -134,6 +135,12 @@ class AMG_Solver
         }
 
         std::shared_ptr<Matrix<T_Config>> m_ptrA;
+
+        // Bandwidth-reducing reordering (reordering=RCM): the inner solver works on a permuted copy
+        // of the user's matrix, shared by copies of this object as the solver is
+        bool m_rcm;
+        std::shared_ptr<ReorderedSystem<T_Config>> m_reorder;
+        Matrix<T_Config> &prepareReordered(Matrix<T_Config> &A, bool keep_permutation);
 
         void mem_manage(Matrix<T_Config> &A)
         {

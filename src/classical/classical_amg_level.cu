@@ -498,6 +498,14 @@ void Classical_AMG_Level<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPr
 }
 
 
+// Numeric-only Galerkin rebuild: on with structure reuse, single GPU, unless numeric_rebuild=0
+template <class TConfig>
+static bool useNumericGalerkin(AMG_Config *cfg, const std::string &scope, const Matrix<TConfig> &A)
+{
+    return cfg->AMG_Config::template getParameter<int>("structure_reuse_levels", scope) != 0 &&
+           cfg->AMG_Config::template getParameter<int>("numeric_rebuild", scope) != 0 && A.is_matrix_singleGPU();
+}
+
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
 void Classical_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::computeAOperator_1x1()
 {
@@ -579,7 +587,20 @@ void Classical_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
     }
 
     RAP.set_initialized( 0 );
-    CSR_Multiply<TConfig_d>::csr_galerkin_product( this->R, this->getA(), this->P, RAP, NULL, NULL, NULL, NULL, NULL, NULL, wk );
+
+    if ( useNumericGalerkin( this->amg->m_cfg, this->amg->m_cfg_scope, this->getA() ) )
+    {
+        if ( !( this->isReuseLevel() && this->m_galerkin.refill( this->R, this->getA(), this->P, RAP ) ) )
+        {
+            this->m_galerkin.build( this->R, this->getA(), this->P, RAP, wk );
+        }
+    }
+    else
+    {
+        this->m_galerkin.clear();
+        CSR_Multiply<TConfig_d>::csr_galerkin_product( this->R, this->getA(), this->P, RAP, NULL, NULL, NULL, NULL, NULL, NULL, wk );
+    }
+
     RAP.set_initialized( 1 );
     int spmm_no_sort = this->amg->m_cfg->AMG_Config::template getParameter<int>("spmm_no_sort", this->amg->m_cfg_scope);
     this->Profile.toc("computeA");

@@ -473,6 +473,11 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("finest_sweeps", "finest level sweeps number", -1);
     AMG_Config::registerParameter<int>("coarsest_sweeps", "the number of smoothing iterations at the coarsest level <2>", 2);
     AMG_Config::registerParameter<int>("cycle_iters", "the number of CG iterations per outer iteration", 2); //only for CG and CGF cycles
+    std::vector<std::string> reordering_values;
+    reordering_values.push_back("NONE");
+    reordering_values.push_back("RCM");
+    AMG_Config::registerParameter<std::string>("reordering", "bandwidth-reducing reordering of the system before the setup (top-level solver scope, single GPU), solved and returned in the original numbering <NONE|RCM>", "NONE", reordering_values);
+    AMG_Config::registerParameter<int>("numeric_rebuild", "with structure_reuse_levels != 0, keep the sorted A P and R A P patterns of SMOOTHED_AGGREGATION and CLASSICAL levels and recompute only their values on reuse levels <0|1>", 1, 0, 1);
     AMG_Config::registerParameter<int>("structure_reuse_levels", "controls reuse of AMG hierarchy, 0 - everything rebuilds, 1 - reuse coloring on the finest level, 2 - reuse coloring on the next level, etc.", 0);
     std::vector<int> error_scaling_values;
     error_scaling_values.push_back(0);

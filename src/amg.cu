@@ -972,6 +972,7 @@ class AMG_Setup
 
                 if ( coarseSolver )
                 {
+                    nvtxRange coarse_nr("coarse_solver_setup");
                     coarseSolver->setup( level_0->getA(), false );
                 }
             }
@@ -998,6 +999,7 @@ class AMG_Setup
 
                 if ( coarseSolver )
                 {
+                    nvtxRange coarse_nr("coarse_solver_setup");
                     coarseSolver->setup( level_1->getA(), false );
                 }
             }

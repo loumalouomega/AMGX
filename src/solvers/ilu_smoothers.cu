@@ -7,6 +7,7 @@
 // (see LICENSES/MIT.txt).
 
 #include <solvers/ilu_smoothers.h>
+#include <amgx_timer.h>
 #include <aggregation/pointwise.h>
 #include <basic_types.h>
 #include <blas.h>
@@ -122,6 +123,8 @@ void ParILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
 
     const Matrix<TConfig> &As = A.hasProps(DIAG) ? A_expanded : A;
 
+    nvtxRange *factor_nr = new nvtxRange("ilu_factorize");
+
     if (this->m_variant == Base::ILUP)
     {
         ParILU<TConfig>::factorPowerPattern(As, this->m_fill_level, this->m_sweeps, this->m_L, this->m_U);
@@ -131,6 +134,8 @@ void ParILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
         ParILU<TConfig>::factorThreshold(As, this->m_drop_tol, this->m_fill_factor, this->m_sweeps, this->m_L, this->m_U);
     }
 
+    delete factor_nr;
+    nvtxRange solve_nr("ilu_solve_setup");
     m_solve.setup(this->m_L, this->m_U,
                   this->m_solve_method == 1 ? ILUTriangularSolve<TConfig>::CUSPARSE : ILUTriangularSolve<TConfig>::JACOBI,
                   this->m_solve_iters, this->m_solve_damping);

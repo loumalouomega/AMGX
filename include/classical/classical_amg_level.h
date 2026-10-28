@@ -12,6 +12,7 @@ template <class T_Config> class Classical_AMG_Level;
 }
 
 #include <amg_level.h>
+#include <numeric_galerkin.h>
 #include <classical/selectors/selector.h>
 #include <classical/strength/strength.h>
 #include <classical/interpolators/interpolator.h>
@@ -95,6 +96,7 @@ class Classical_AMG_Level_Base : public AMG_Level<T_Config>
         void computeAOperator();
         void computeAOperator_distributed();
         Matrix<TConfig> P, R;
+        NumericGalerkin<TConfig> m_galerkin;   // numeric-only Galerkin product on structure-reuse levels
 
         Selector<TConfig> *selector;
         Interpolator<TConfig> *interpolator;
