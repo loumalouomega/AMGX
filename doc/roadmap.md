@@ -16,287 +16,96 @@ Every item specifies a **probe** (a reproducible test or failure threshold demon
 ## How this file works
 
 - **Sections are strictly ordered by engineering dependency.** Each section defines its architectural scope; items do not move up due to novelty or standalone interest.
-- **Defect-shaped items belong in a *Correctness Debts* section (§1).** None is currently open; the first silent failure, NaN leak, memory corruption, or convergence stall opens §1 and renumbers subsequent sections.
+- **Defect-shaped items belong in a *Correctness Debts* section (§1).** Opened 2026-10-28 by C1; defects fixed in the change that found them are recorded under [Non-goals and decisions taken](#non-goals-and-decisions-taken) instead.
 - **Closed items are removed entirely**, not struck through.
 - **Verification status:** Items estimated without direct source inspection state `(verify first)` alongside their targeted probe.
 - **[Non-goals and decisions taken](#non-goals-and-decisions-taken)** record definitive architectural choices with rationale to eliminate recurrent debate.
 
 ---
 
-## 1. Port Missing AMGCL Features to NVIDIA AMGX
+## 1. Correctness Debts
+
+No open debts. C1 (PBICGSTAB false convergence) and C2 (SA on BSR with multicolor smoothers) are closed in decision 14.
+
+---
+
+## 2. Port Missing AMGCL Features to NVIDIA AMGX
 
 ### Scope & Architectural Boundary
 
 AMGX natively supports classical AMG (Ruge-Stüben, PMIS/HMIS, aggressive coarsening), standard smoothers (Jacobi, block/CF Jacobi, Gauss-Seidel, Multicolor GS/DILU, ILU($k$), Chebyshev/KPZ polynomials), Krylov accelerators (CG, PCG, BiCGStab, GMRES, IDR($s$)), block/BSR operations, MPI rank consolidation with CUDA IPC, and setup structure reuse. **None of these are porting targets.**
 
-The primary architectural gap in AMGX is that its aggregation hierarchy relies on **plain, unsmoothed aggregation with binary transfer operators** ($P \in \{0, 1\}^{n \times m}$), creating coarse spaces that fail to preserve low-energy error modes on elliptic PDEs with high anisotropy, jump coefficients, or vector fields (e.g., linear elasticity). 
+AMGX's `AGGREGATION` level uses **plain, unsmoothed aggregation with binary transfer operators** ($P \in \{0, 1\}^{n \times m}$). The `SMOOTHED_AGGREGATION` level (single GPU) now provides AMGCL's smoothed aggregation:
+- symmetric strength filter
+- pointwise aggregation for BSR or interleaved scalar systems
+- near-nullspace QR prolongation (`AMGX_matrix_set_nullspace`, `AMGX_generate_rigid_body_modes`)
+- filtered-Jacobi smoothing with nullspace-preserving truncation
+- floating-point Galerkin product
 
-The goal of this section is to bring AMGCL's production-grade **Smoothed Aggregation (SA)**, **Near-Nullspace Tentative Prolongation**, **Prolongation Filtering**, and **Composite Physics Preconditioners** into AMGX's high-throughput GPU pipeline.
+Over-interpolation is available on `AGGREGATION`. The distributed version is P4.2.
+
+Coloring-free smoothers are also available (scalar, single GPU, setup on the GPU):
+- `SPAI0` (also BSR) and `SPAI1`
+- `ILUP` and `ILUT`, factorized with parallel ParILU/ParILUT sweeps, with Jacobi or exact cuSPARSE SpSV triangular solves
+
+The goal of this section is to bring the remaining AMGCL components into AMGX's GPU pipeline: SA performance verification, advanced smoothers, Krylov accelerators and **Composite Physics Preconditioners**.
 
 ```
-       [Strength-of-Connection Filter] (P0.1)
-                     │
-       ┌─────────────┴─────────────┐
-       ▼                           ▼
-[Plain Aggregates] (P0.2)   [BSR Pointwise] (P0.3)
-       │                           │
-       └─────────────┬─────────────┘
-                     ▼
-        [Batched QR / Nullspace] (P0.4) ─── [Rigid-Body Mode Gen] (P0.5)
+   [SMOOTHED_AGGREGATION level, single GPU]  (shipped)
                      │
                      ▼
-       [Spectral Radius Est.] (P0.6)
+    [H100 / A100 Performance Verification] (P0.12)
                      │
                      ▼
-       [Filtered-Jacobi Smoothing] (P0.7)
-                     │
-                     ▼
-     [Prolongation Truncation] (P0.8) ◄── (Prevents SpGEMM memory explosion)
-                     │
-                     ▼
-    [Galerkin Coarse SpGEMM: PᵀAP] (P0.9)
-                     │
-         ┌───────────┴───────────┐
-         ▼                       ▼
-[Scalar SA Pipeline]     [BSR as_scalar] (P0.11)
-         │                       │
-         └───────────┬───────────┘
-                     ▼
-    [Distributed MPI Smoothing] (P4.2)
+       [Distributed MPI Smoothed Aggregation] (P4.2)
 ```
 
 ---
 
 ### P0: Aggregation, Prolongation, and Coarsening Engine
 
-#### P0.1 Symmetric Strength-of-Connection Filter with Diagonal Lumping
-
-- **Effort:** **M**
-- **Gap:** AMGX's aggregation algorithms (`SIZE_2`, `SIZE_4`, `SIZE_8`) operate on unweighted or naively thresholded adjacency graphs. AMGCL applies a scaled symmetric filtering criterion that lumps discarded weak connections back into the matrix diagonal to preserve row sums (zero-energy modes).
-- **Mathematical Specification:**
-  A connection between degree of freedom $i$ and $j$ ($i \ne j$) is strong if:
-  $$\frac{a_{ij}^2}{a_{ii} a_{jj}} > \varepsilon_{\text{strong}} \quad (\text{default: } \varepsilon_{\text{strong}} = 0.08)$$
-  Weak edges ($a_{ij}^2 \le \varepsilon_{\text{strong}} a_{ii} a_{jj}$) are purged from the sparsity graph of $A^F$. To preserve row sums for the filtered matrix $A^F$:
-  $$A^F_{ii} = A_{ii} + \sum_{j \in \text{weak}(i)} A_{ij}$$
-  Per-level decay: $\varepsilon_{\text{strong}}^{(l+1)} = \max(\varepsilon_{\text{strong}}^{(l)} \times 0.5, \, 10^{-4})$ to prevent early stagnation on deep coarse levels.
-- **AMGX Target:** `src/aggregation/strength/` registered as `SYMMETRIC_SCALED`.
-- **AMGCL Reference:** `amgcl/detail/scaled_galerkin.hpp`, `amgcl/coarsening/plain_aggregates.hpp`.
-- **Probe:** Run 3D Poisson with strong anisotropy ($\kappa_x = 1, \kappa_y = 1, \kappa_z = 10^{-3}$) on a $128 \times 128 \times 32$ grid. AMGX default aggregation degrades to $\rho > 0.88$ per V-cycle. The probe passes when `SYMMETRIC_SCALED` creates non-isotropic 1D line aggregates along the $z$-direction and achieves asymptotic convergence factor $\rho \le 0.18$.
-
-#### P0.2 GPU Parallel Aggregate Extraction
+#### P0.12 Data-Center GPU Performance Verification of the SA Setup
 
 - **Effort:** **S**
-- **Gap:** AMGCL uses a sequential greedy MIS-2 sweep on the CPU. AMGX has high-speed parallel matching routines (`MATCHING`, `THRUST`), but they do not emit an explicit aggregate-to-node index mapping compatible with multi-vector prolongation.
-- **Specification:** Adapt AMGX's parallel maximal independent set / maximum weight matching kernels to output an aggregate index array:
-  $$\text{agg\_id}[i] \in [0, N_{\text{aggregates}}-1] \quad \forall i \in [0, N-1]$$
-  Ensure every unaggregated vertex is assigned to an adjacent aggregate via a parallel boundary-attraction kernel (one GPU pass per unassigned vertex).
-- **AMGX Target:** `src/aggregation/selectors/`.
-- **Probe:** Verify parallel aggregation of a 10M row Laplacian on a single H100 in $< 15\text{ ms}$; zero unassigned nodes; aggregate sizes bounded within $[2, 16]$.
-
-#### P0.3 Pointwise Aggregation for Block/BSR Matrices
-
-- **Effort:** **M**
-- **Gap:** Aggregating each equation of a multi-variable PDE separately destroys block coupling. AMGCL aggregates on the structural graph of grid nodes (pointwise), not individual DOFs.
-- **Specification:** For BSR systems with block dimension $B \in [2, 6]$, construct a scalar adjacency graph $G_{\text{point}} = (V_{\text{point}}, E_{\text{point}})$ where:
-  $$(I, J) \in E_{\text{point}} \iff \exists i \in \text{dofs}(I), j \in \text{dofs}(J) \text{ s.t. } \|A_{ij}\|_{F}^2 > \varepsilon_{\text{strong}}^2 \|A_{ii}\|_F \|A_{jj}\|_F$$
-  Run P0.2 on $G_{\text{point}}$ and expand the resulting aggregate mapping to all DOFs: $\text{agg\_id}_{\text{dof}}(I \cdot B + k) = \text{agg\_id}_{\text{point}}(I) \cdot B + k$.
-- **AMGCL Reference:** `amgcl/coarsening/pointwise_aggregates.hpp`.
-- **Probe:** Solve 3D Navier-Stokes velocity-pressure coupled BSR system ($B=4$). Verify all components of velocity and pressure at physical node $I$ share identical aggregate assignments.
-
-#### P0.4 Batched In-Warp QR for Near-Nullspace Tentative Prolongation
-
-- **Effort:** **L**
-- **Gap:** AMGX builds binary prolongators $\tilde{P}_{ij} \in \{0, 1\}$. It lacks an API to supply near-nullspace modes (e.g., rigid-body translations and rotations) and cannot perform local QR factorizations to construct an orthonormal tentative prolongator $\tilde{P}$.
-- **Mathematical Specification:**
-  Given $K$ user-defined near-nullspace vectors arranged as $B \in \mathbb{R}^{N \times K}$ (where $K \ll N$, e.g., $K=6$ for 3D elasticity). For aggregate $i$ with $m_i$ local rows, extract the submatrix $B_i \in \mathbb{R}^{m_i \times K}$.
-  Compute the thin QR factorization locally on GPU:
-  $$B_i = Q_i R_i, \quad Q_i \in \mathbb{R}^{m_i \times K}, \quad R_i \in \mathbb{R}^{K \times K}$$
-  Define the tentative prolongator $\tilde{P}$ by setting block row $i$ to $Q_i$. Coarse nullspace candidate for the next level:
-  $$B_c^{(i)} = R_i$$
-- **GPU Architecture Implementation:**
-  Do **not** call `cuSOLVER` (kernel launch overhead kills performance for $10^5$ tiny matrices). Implement an in-warp Modified Gram-Schmidt (MGS) or Householder reflector kernel:
-  - 1 warp per aggregate for $m_i \le 32, K \le 6$.
-  - Keep $B_i$ entirely in registers and shuffle across lanes.
-- **AMGX C API Addition:**
-  
-  ```c
-  AMGX_RC AMGX_matrix_set_nullspace(AMGX_matrix_handle mtx, int num_vectors, const double **vectors);
-  ```
-- **Probe:** Pass 6 analytical rigid-body modes into a cantilever beam problem ($10^6$ DOFs). Prove that $\tilde{P}^T \tilde{P} = I_K$ to machine precision ($\| \tilde{P}^T \tilde{P} - I_K \|_2 < 10^{-14}$) and that coarse nullspace candidate satisfies $\tilde{P} B_c = B$.
-
-#### P0.5 Rigid-Body Mode Generator Utility
-
-- **Effort:** **S**
-- **Gap:** Users must manually construct spatial coordinate rotation modes.
-- **Specification:** C API and internal utility taking nodal coordinates $(x_i, y_i, z_i)$ and producing:
-  - 2D ($K=3$): Translations $(1, 0), (0, 1)$; Rotation $(-y_i, x_i)$.
-  - 3D ($K=6$): Translations $(1,0,0), (0,1,0), (0,0,1)$; Rotations $(0, -z_i, y_i), (z_i, 0, -x_i), (-y_i, x_i, 0)$.
-- **AMGCL Reference:** `amgcl/coarsening/rigid_body_modes.hpp`.
-- **Probe:** Unit test checking mutual orthogonality of generated modes on a regular grid and verifying rigid-body strain energy $\mathbf{u}^T K \mathbf{u} < 10^{-10}$ with a free-floating stiffness matrix.
-
-#### P0.6 Spectral Radius Estimator ($\rho(D^{-1} A^F)$)
-
-- **Effort:** **S**
-- **Gap:** Smoothed aggregation requires an accurate upper bound of the maximum eigenvalue of the diagonally preconditioned filtered matrix to scale Jacobi prolongation smoothing without divergence.
-- **Specification:**
-  - `power_iters = 0`: Fast Gershgorin circle bound:
-    $$\lambda_{\max} \le \max_i \left( \frac{1}{|A_{ii}|} \sum_{j} |A_{ij}^F| \right)$$
-  - `power_iters > 0` (default: 4): Batched power iteration with Rayleigh quotient on GPU:
-    $$x_{k+1} = D^{-1} A^F x_k, \quad \rho \approx \frac{x_{k+1}^T x_k}{x_k^T x_k}$$
-  - Calculate relaxation parameter:
-    $$\omega = \text{relax} \times \frac{4}{3 \, \rho(D^{-1} A^F)} \quad (\text{default: relax} = 0.67)$$
-- **AMGX Configuration Flags:** `estimate_spectral_radius=1`, `power_iters=4`, `relax=0.67`.
-- **Probe:** Match analytical $\lambda_{\max} = 4.0$ on 1D discrete Laplacian within $1\%$ error using 4 power iterations.
-
-#### P0.7 Filtered-Jacobi Prolongator Smoothing
-
-- **Effort:** **L**
-- **Gap:** AMGX prolongators are piecewise constant. High-frequency error components are not damped across level transfers, degrading convergence on nonsmooth problems.
-- **Specification:** Smooth the tentative prolongator $\tilde{P}$ using the filtered matrix $A^F$:
-  $$P = \left( I - \omega D^{-1} A^F \right) \tilde{P}$$
-  Implementation must use a custom fused Sparse-Matrix times Tall-Skinny-Matrix kernel or AMGX SpGEMM (`A_smoother * P_tilde`).
-- **AMGX Target:** Register selector `SMOOTHED_AGGREGATION` in `src/aggregation/`.
-- **AMGCL Reference:** `amgcl/coarsening/smoothed_aggregation.hpp`.
-- **Probe:** On a 2D biharmonic equation $\Delta^2 u = f$, standard AMGX unsmoothed aggregation diverges or requires $> 150$ iterations. Smoothed aggregation must converge within 25 iterations.
-
-#### P0.8 Prolongator Sparsity Truncation (Anti-Dilation Gate)
-
-- **Effort:** **M**
-- **Gap:** **Critical omission in basic SA.** Applying $(I - \omega D^{-1} A^F) \tilde{P}$ triples stencil widths. Without truncation, coarse operators $A_c = P^T A P$ rapidly become dense, exhausting GPU memory by level 3.
-- **Specification:** Implement post-smoothing drop tolerance:
-  $$P_{ij} = \begin{cases} 0 & \text{if } |P_{ij}| < \varepsilon_{\text{drop}} \max_k |P_{ik}| \quad (\text{default: } \varepsilon_{\text{drop}} = 0.02) \\ P_{ij} & \text{otherwise} \end{cases}$$
-  Followed by column-wise rescaling to ensure the near-nullspace property is strictly preserved:
-  $$\sum_j P_{ij} B_{c, j} = B_i$$
-- **Probe:** Profile operator complexity on a 3D 27-point stencil ($64^3$). Truncation must keep operator complexity below $1.35\times$ while unsmoothed/untruncated exceeds $2.5\times$, preserving total GPU VRAM consumption under 4 GB.
-
-#### P0.9 Optimized Triple Product Galerkin Coarse Operator ($A_c = P^T A P$)
-
-- **Effort:** **M**
-- **Gap:** AMGX currently performs $P^T A P$ assuming binary (boolean) $P$, which reduces to row/column index summation. Smoothed $P$ has floating-point entries, requiring a true floating-point triple matrix product.
-- **Specification:** Integrate a two-stage SpGEMM:
-  1. $R = P^T A$ via cuSPARSE `cusparseSpGEMM` or internal AMGX hash-based SpGEMM.
-  2. $A_c = R P$.
-     Provide memory workspace estimation to prevent out-of-memory crashes on large GPU allocations.
-- **Probe:** Zero difference in numerical values between computed $A_c$ and host reference `scipy.sparse` computation; execution time under 40 ms on 1M unknowns on an A100.
-
-#### P0.10 Scaled Galerkin / Over-Interpolation
-
-- **Effort:** **S**
-- **Gap:** When unsmoothed aggregation must be retained for low setup cost, coarse grid corrections tend to over-correct high frequencies.
-- **Specification:** Introduce an empirical damping factor $\alpha$ directly into the coarse operator:
-  $$A_c = \frac{1}{\alpha} P^T A P \quad (\text{default: } \alpha = 1.5)$$
-  Expose parameter `over_interp` in AMGX configuration files.
-- **AMGCL Reference:** `amgcl/detail/scaled_galerkin.hpp`.
-- **Probe:** On 3D isotropic Poisson, verify that setting `over_interp=1.5` reduces V-cycle count of unsmoothed aggregation by at least $25\%$.
-
-#### P0.11 `as_scalar` Adapter for Coupled Multi-Physics
-
-- **Effort:** **M**
-- **Gap:** Many simulations provide coupled PDE matrices in scalar CSR format rather than structured BSR, but naive scalar aggregation mixes physical fields arbitrarily.
-- **Specification:** Provide a logical wrapper that reindexes a scalar CSR matrix of interleaved DOFs (e.g., $u_1, v_1, p_1, u_2, v_2, p_2, \dots$) into a virtual block matrix with block dimension $B$, runs pointwise aggregation (P0.3), builds tentative and smoothed prolongators, and unpacks the resulting operators back into standard scalar CSR format.
-- **Probe:** Solve an unstructured 3D Stokes system supplied as a pure scalar CSR; verify convergence rate is identical to explicit BSR input within $2\%$ runtime difference.
+- **Gap:** The SA setup kernels are functionally verified (unit tests `SA*` in `src/tests/smoothed_aggregation.cu`), but their absolute timing targets were set for data-center GPUs. They have only been measured on an RTX 2000 Ada laptop GPU (8 GB).
+- **Specification:** Profile `strongConnectionsKernel`, the `MIS2Aggregates` kernels and `CSR_Multiply::csr_galerkin_product` on the target hardware. Optimize the thread-per-row kernels (strength, MIS rounds, nullspace truncation) to warp-per-row variants if they dominate.
+- **Probe:**
+  - Strength plus MIS(2) aggregation of a 10M-row 7-point Laplacian in $< 15\text{ ms}$ on one H100. On RTX 2000 Ada, 4.1M rows take about 40 ms of kernel time over all levels.
+  - $A_c = P^T A P$ for 1M unknowns in $< 40\text{ ms}$ on an A100.
 
 ---
 
 ### P1: Advanced Smoothers and Relaxation
 
-#### P1.1 Sparse Approximate Inverse: SPAI-0 and SPAI-1
+#### P1.3 ParILUT Step Throughput
 
-- **Effort:** **M** (SPAI-0: **S**, SPAI-1: **M**)
-- **Gap:** AMGX relies on Jacobi, Gauss-Seidel, or ILU($k$). Gauss-Seidel and ILU are sequential by nature and require matrix coloring, which degrades smoothing quality on highly unstructured grids. SPAI smoothers are inherently parallel and require no coloring.
-- **Mathematical Specification:**
-  Compute an explicit sparse matrix $M \approx A^{-1}$ minimizing $\|AM - I\|_F^2$.
-  - **SPAI-0 (Static diagonal sparsity pattern):**
-    $$M = \operatorname{diag}(m_i), \quad m_i = \frac{A_{ii}}{\sum_j A_{ij}^2}$$
-    Completely closed-form, single-kernel GPU implementation.
-  - **SPAI-1 (Sparsity pattern of $M$ matches the sparsity pattern of $A$):**
-    For each row $i$, let $\mathcal{J}_i = \{j \mid A_{ij} \ne 0\}$. Solve an independent tiny dense least-squares problem:
-    $$\min_{m_i} \| A(\mathcal{J}_i, \mathcal{J}_i) m_i - e_i \|_2^2$$
-    Execute via batched small Givens QR in CUDA shared memory.
-- **AMGX Target:** Register smoothers `SPAI0` and `SPAI1` in `src/smoothers/`.
-- **AMGCL Reference:** `amgcl/relaxation/spai0.hpp`, `amgcl/relaxation/spai1.hpp`.
-- **Probe:** Run on an advection-diffusion matrix with high Péclet number ($Pe = 10^4$) where Multicolor Gauss-Seidel stalls; verify SPAI-1 reduces residual by 1 order of magnitude per smoothing pass without requiring graph coloring.
+- **Effort:** **M**
+- **Gap:** The redesign of decision 14 makes the ILUP setup 4–9× faster and its resetup 12× faster. ParILUT keeps the iteration counts and is 3× faster at 20 sweeps (0.688 → 0.229 s on the 65k-row probe), but a step still costs 4–20 ms as the pattern fills in.
+  - Profile at 20 sweeps: the candidate key sort 30%, per-entry rank selection 16%, candidate generation (thread per row) 9%, candidate values 8%.
+  - Iterations by sweep count (unchanged by the redesign):
 
-#### P1.2 Dual-Threshold Incomplete LU (ILUT) and Power-Pattern ILU (ILUP)
+  | Sweeps | 3 | 5 | 8 | 10 | 15 | 20 | AMGCL exact |
+  |---|---|---|---|---|---|---|---|
+  | Iterations | 37 | 23 | 15 | 12 | 10 | 9 | 9 |
+  | Setup (s) | 0.04 | 0.05 | 0.06 | 0.09 | 0.16 | 0.23 | 0.07 |
 
-- **Effort:** **L**
-- **Gap:** AMGX's `ILU0` and `ILUK` retain fixed static structural patterns based on graph distance $k$. They fail on matrices with dynamic recirculation or localized boundary layers where fill-in must follow numerical magnitudes.
 - **Specification:**
-  - **ILUT (Threshold-based drop rule):** Drop entries if $|l_{ij}| < \tau |a_{ii}|$ or $|u_{ij}| < \tau |a_{ii}|$, while strictly limiting the maximum nonzeros per row to $p$. Implement via GPU parallel merge-sort or quickselect per row.
-  - **ILUP (Symbolic matrix power pattern):** Compute sparsity pattern from the structural matrix power $A^p$, then compute numerical factorizations into that pre-allocated pattern on GPU.
-- **AMGCL Reference:** `amgcl/relaxation/ilut.hpp`, `amgcl/relaxation/ilup.hpp`.
-- **Probe:** Solve anisotropic convection-diffusion problem where standard `ILU0` fails to factorize or diverges; show stable factorization and convergence with $\tau = 10^{-3}, p = 30$.
+  - Per-row candidate generation and de-duplication in shared memory (warp per row), replacing the global key sort.
+  - Selection by a per-row bitonic sort on |v| instead of O(len²) rank counting.
+  - An asynchronous Gauss-Seidel-style sweep variant behind `determinism_flag=0`.
+- **Probe:** ILUT on the 65k-row anisotropic convection-diffusion probe reaches AMGCL's GMRES(50) iteration count (9) with setup at most AMGCL's serial time (0.07 s) on RTX 2000 Ada.
 
 ---
 
 ### P2: Krylov Accelerators
 
-#### P2.1 BiCGStab(L) with Polynomial Stabilization
-
-- **Effort:** **M**
-- **Gap:** AMGX provides standard `BICGSTAB` ($L=1$). Standard BiCGStab exhibits severe residual oscillations and stagnation when the system matrix has complex eigenvalues with large imaginary parts (e.g., high-frequency Helmholtz or non-Hermitian wave propagation).
-- **Mathematical Specification:**
-  Generalize the scalar stabilization parameter $\omega$ of BiCGStab to a degree-$L$ polynomial ($L \in [2, 8]$). Maintain a Krylov subspace $\operatorname{span}\{r, Ar, A^2 r, \dots, A^L r\}$ and minimize the residual over the subspace every $L$ steps using a small dense $L \times L$ least-squares system.
-- **AMGX Target:** Register solver `BICGSTABL` with configuration parameter `bicgstab_l` (default: 2 or 4).
-- **AMGCL Reference:** `amgcl/solver/bicgstabl.hpp`.
-- **Probe:** High-wavenumber Helmholtz problem ($\kappa = 50$). Prove `BICGSTABL` ($L=4$) converges monotonically without the erratic spikes or stagnation observed in AMGX's default `BICGSTAB`.
-
-#### P2.2 Augmented Restarted GMRES (LGMRES)
-
-- **Effort:** **M**
-- **Gap:** Restarted GMRES($m$) suffers from alternating convergence stalls when error vectors cycle through invariant subspaces. AMGCL includes LGMRES, which preserves approximations of the error vector across restart boundaries.
-- **Specification:**
-  At each restart of GMRES($m$), add $k$ error vectors $z_j = x_m - x_0$ from the previous $k$ restart cycles into the Krylov basis alongside standard Krylov vectors $v_1, \dots, v_{m-k}$.
-- **AMGX Target:** Register solver `LGMRES` with parameters `gmres_m` (default: 30) and `lgmres_k` (default: 3).
-- **AMGCL Reference:** `amgcl/solver/lgmres.hpp`.
-- **Probe:** Test on a recirculating cavity flow matrix where `GMRES(30)` exhibits stagnation cycles; verify `LGMRES(30, 3)` breaks the limit cycle and converges in $< 3$ restarts.
+All P2 items are closed (decisions 11 and 14).
 
 ---
 
 ### P3: Composite Physics Preconditioners
 
-#### P3.1 Constrained Pressure Residual (CPR) and Dynamic Row-Sum (CPR-DRS)
-
-- **Effort:** **L**
-- **Gap:** Reservoir simulation and multiphase flow produce highly ill-conditioned coupled systems with distinct elliptic (pressure) and hyperbolic (saturation) regimes. AMGX lacks a native two-stage physics-split solver.
-- **Mathematical Specification:**
-  Given the blocked system:
-  $$\begin{bmatrix} A_{pp} & A_{ps} \\ A_{sp} & A_{ss} \end{bmatrix} \begin{bmatrix} u_p \\ u_s \end{bmatrix} = \begin{bmatrix} f_p \\ f_s \end{bmatrix}$$
-  1. **Decoupling Stage (DRS):** Compute a row-scaling transformation $F$ to eliminate weak cross-coupling terms:
-     $$F = \begin{bmatrix} I & -\operatorname{diag}(A_{ps}) \operatorname{diag}(A_{ss})^{-1} \\ 0 & I \end{bmatrix}$$
-  2. **True Pressure Extraction:** Form the pressure system $A_p = R A F^T$, where $R$ extracts the pressure equations.
-  3. **Two-Stage Cycle:**
-     - Stage 1: Solve elliptic pressure part $A_p \Delta u_p = r_p$ with AMGX Smoothed Aggregation AMG.
-     - Stage 2: Correct full residual with global ILU(0) or Block-Jacobi smoother: $u \leftarrow u + M^{-1}(f - A u)$.
-- **Configuration Parameters:** `cpr_block_size`, `eps_dd`, `eps_ps`, `drs_weight`.
-- **AMGCL Reference:** `amgcl/preconditioner/cpr.hpp`, `amgcl/preconditioner/cpr_drs.hpp`.
-- **Probe:** Run SPE10 Benchmark Model 2 reservoir dataset. AMGX single-stage AMG fails or takes $> 500$ iterations. CPR-DRS must converge within 35 outer FGMRES iterations.
-
-#### P3.2 Schur Complement Pressure Correction (Navier-Stokes / Stokes)
-
-- **Effort:** **L**
-- **Gap:** Incompressible flow produces saddle-point systems with zero pressure diagonal blocks, rendering standard AMG coarsening mathematically invalid.
-- **Specification:**
-  Given:
-  $$\begin{bmatrix} A & B_1^T \\ B_2 & -C \end{bmatrix} \begin{bmatrix} u \\ p \end{bmatrix} = \begin{bmatrix} f \\ g \end{bmatrix}$$
-  Construct an approximate Schur complement matrix explicitly on GPU:
-  $$\hat{S} = C + B_2 \left[\operatorname{diag}(A)\right]^{-1} B_1^T$$
-  Implement block-triangular preconditioning:
-  1. Solve $\hat{S} \Delta p = B_2 A^{-1} f - g$ using Pressure AMG.
-  2. Solve $A \Delta u = f - B_1^T \Delta p$ using Velocity AMG/Smoother.
-- **AMGCL Reference:** `amgcl/preconditioner/schur_pressure_correction.hpp`.
-- **Probe:** 3D Lid-driven cavity Stokes problem ($C = 0$). Standard AMGX errors out on zero diagonal; Schur preconditioner converges within 20 iterations.
-
-#### P3.3 Coarse-Space Deflated Preconditioner
-
-- **Effort:** **M**
-- **Gap:** When a matrix has a small set of isolated extremely small eigenvalues, standard multigrid smoothers and coarse grids cannot damp them, causing flat convergence tails.
-- **Specification:**
-  Project out a deflation subspace $V \in \mathbb{R}^{n \times k}$ (e.g., rigid-body modes or user vectors):
-  $$P_{\text{def}} = I - A V (V^T A V)^{-1} V^T$$
-  Apply standard AMG to the deflated operator, evaluating the coarse $k \times k$ projection directly on GPU using dense LU factorization.
-- **AMGCL Reference:** `amgcl/deflated_solver.hpp`.
-- **Probe:** Poisson problem with $100$ disjoint subdomains without Dirichlet grounding (singular Neumann problem with 100 zero eigenvalues). Deflated solver converges cleanly; un-deflated AMG diverges.
+All P3 items are closed; design choices and AMGCL-baseline measurements are in decision 12.
 
 ---
 
@@ -312,7 +121,7 @@ The goal of this section is to bring AMGCL's production-grade **Smoothed Aggrega
 #### P4.2 Distributed Smoothed Aggregation
 
 - **Effort:** **L**
-- **Dependencies:** Requires P0.1, P0.4, P0.6, P0.7.
+- **Dependencies:** Builds on the single-GPU `SMOOTHED_AGGREGATION` level (`src/aggregation/sa_amg_level.cu`); explicit-$P$ distributed machinery exists only on the classical path (`renumber_P_R`, `exchange_halo_rows_P`, `exchange_RAP_ext`).
 - **Specification:** Extend smoothed aggregation to MPI distributed matrices (`DistributedMatrix`):
   - Distributed boundary exchange for halo-aggregate tentative prolongation.
   - Parallel communication of off-rank near-nullspace orthonormalization vectors.
@@ -323,47 +132,52 @@ The goal of this section is to bring AMGCL's production-grade **Smoothed Aggrega
 
 ### P5: Adapters, Reordering, and Setup Reuse
 
-#### P5.1 Reverse Cuthill-McKee (RCM) Bandwidth Minimization Adapter
+#### P5.1 RCM L2-Miss Measurement
 
-- **Effort:** **M**
-- **Gap:** AMGX provides matrix coloring routines, but lacks bandwidth-reducing reordering. RCM substantially improves GPU L2 cache hit rates for sparse matrix-vector multiplication (SpMV) and incomplete factorizations.
-- **Specification:** Implement a fast GPU-accelerated Reverse Cuthill-McKee permutation kernel. Reorder matrix rows and columns before hierarchy construction; automatically un-permute solution vectors upon return.
-- **AMGCL Reference:** `amgcl/adapter/reorder.hpp`.
-- **Probe:** On a high-aspect-ratio serpentine mesh, profile SpMV with NVIDIA Nsight Compute. RCM reordering must show $\ge 25\%$ reduction in L2 cache misses and a minimum $15\%$ throughput increase in AMG smoothing cycles.
-
-#### P5.2 Hierarchy Numerical Rebuild vs. Structural Reuse Parity Check
-
-- **Effort:** **M** `(verify first)`
-- **Gap:** In non-linear Newton-Raphson or transient time-stepping problems, sparsity patterns remain invariant while matrix coefficients change every step. AMGCL has an ultra-fast `rebuild()` path that updates numerical values of $A_c$ and smoother factors without recomputing graph aggregation. AMGX has `structure_reuse_levels`, but its exact boundary must be benchmarked.
-- **Probe:** Profile 50 consecutive non-linear iterations. If AMGX spends $> 20\%$ of hierarchy update time in symbolic structure analysis or reallocation, implement a strict numeric-only update path (`AMGX_matrix_replace_coefficients` pipeline).
+- **Effort:** **S**
+- **Gap:** The RCM reordering is implemented (`reordering=RCM`, decision 13). Its throughput probe is met on unstructured numberings. The Nsight Compute L2-miss half of the probe is not measured yet: GPU performance counters are blocked on the development machine (`ERR_NVGPUCTRPERM`; on WSL, NVIDIA Control Panel → Developer → Manage GPU Performance Counters).
+- **Probe:**
+  - Mesh: the 16.9M-cell serpentine of decision 13, randomly numbered.
+  - Metrics: `ncu --metrics lts__t_sectors_srcunit_tex_lookup_miss.sum,lts__t_sectors_srcunit_tex.sum` on the SpMV (`csrmv`) and smoother kernels.
+  - Threshold: $\ge 25\%$ fewer L2 misses with `reordering=RCM`.
 
 ---
 
-## 2. Implementation Execution Plan
+## 3. Implementation Execution Plan
 
 The work must proceed in four tightly gated stages. Each stage ends with an empirical validation milestone that must be met before advancing.
 
 ```
-Stage 1: Core Scalar Smoothed Aggregation Engine
-  [P0.1 Strength] ──► [P0.2 Aggregates] ──► [P0.6 Spectral Radius] ──► [P0.7 Filtered-Jacobi] ──► [P0.8 Truncation] ──► [P0.9 Galerkin]
-  Milestone: 3D Anisotropic Diffusion convergence factor ρ ≤ 0.18 on a single GPU.
+Stage 1: Core Scalar Smoothed Aggregation Engine                      [done, 2026-10-28]
+  Milestone (AMGCL baseline): SA-PCG iteration counts at most 1.3x those of AMGCL CG+SA with the same smoother.
+  Met on the anisotropic and isotropic 3D Poisson problems (22 vs 17 and 20 vs 17 with Jacobi, 15 vs 13 and 14 vs 13 with GS).
 
-Stage 2: Vector PDEs & Block Elasticity Subsystem
-  [P0.3 BSR Aggs] ──► [P0.4 Batched QR] ──► [P0.5 Rigid-Body Modes] ──► [P0.10 Over-Interp] ──► [P0.11 as_scalar]
-  Milestone: 3D Cantilever Beam Elasticity (6 rigid-body modes) converges in < 30 iterations.
+Stage 2: Vector PDEs & Block Elasticity Subsystem                      [done, 2026-10-28]
+  Milestone (AMGCL baseline): clamped 3D elasticity with 6 rigid-body modes converges at AMGCL parity or better.
+  PCG iterations, AMGX vs AMGCL CG+SA:
+    15k DOFs:  19 (BSR and scalar) vs 40
+    107k DOFs: 48 (BSR) / 32 (scalar) vs 54
+    812k DOFs: 54 (BSR and scalar)
+  Remaining: [P0.12 H100/A100 timing]
 
 Stage 3: Advanced Smoothers & Composite Preconditioners
-  [P1.1 SPAI-0/1] ──► [P1.2 ILUT/ILUP] ──► [P2.1 BiCGStab(L)] ──► [P2.2 LGMRES] ──► [P3.1 CPR-DRS] ──► [P3.2 Schur] ──► [P3.3 Deflated]
-  Milestone: SPE10 Benchmark Model 2 converges in < 35 iterations; Stokes lid-driven cavity converges in < 20 iterations.
+  [P1.1 SPAI-0/1, done] ──► [P1.2 ILUT/ILUP, done; P1.3 ParILUT throughput open] ──► [P2.1 BiCGStab(L), done] ──► [P2.2 LGMRES, done] ──► [P3.1 CPR-DRS, done] ──► [P3.2 Schur, done] ──► [P3.3 Deflated, done]
+  Milestone (AMGCL baseline, decision 12):
+    SPE10 Model 2 (2.24M unknowns): CPR-DRS + FGMRES(50) in 85 iterations vs AMGCL 156. The absolute < 35 is missed
+      (85 iterations; 32 on Upper Ness alone). Single-stage AMG and ILU(0) do not converge in 500.
+    3D lid-driven cavity Stokes, MAC: Schur pressure correction in 19 (32^3) and 20 (48^3) iterations. Met.
+  Remaining: [P1.3 ParILUT step throughput]
 
 Stage 4: Distributed Scaling, Cache Optimization, and Production Hardening
-  [P4.1 ParMETIS] ──► [P4.2 Distributed SA] ──► [P5.1 RCM Reorder] ──► [P5.2 Numeric Rebuild]
+  [P4.1 ParMETIS] ──► [P4.2 Distributed SA] ──► [P5.1 RCM Reorder, done; L2 measurement open] ──► [P5.2 Numeric Rebuild, done]
   Milestone: Weak scaling across 64+ GPUs maintains ≥ 75% parallel efficiency on unstructured meshes.
+  P5 measured (decision 13): RCM 2.6-2.8x faster CG / AMG-PCG iterations on a randomly numbered 16.9M-cell
+    serpentine (no change on lexicographic numbering); coefficient-only resetup 49% (SA) / 37% (classical) faster.
 ```
 
 ---
 
-## 3. Configuration & Parameter Mapping Reference
+## 4. Configuration & Parameter Mapping Reference
 
 To maintain ergonomic parity with AMGCL while integrating cleanly into AMGX, all newly exposed parameters follow the AMGX JSON/string configuration schema:
 
@@ -371,18 +185,41 @@ To maintain ergonomic parity with AMGCL while integrating cleanly into AMGX, all
 | --------------- | --------------- | -------------------------- | ------- | ------- | ----------------------------------------------- |
 | **Strength**    | `eps_strong`    | `aggregation_eps_strong`   | `float` | `0.08`  | Threshold for symmetric strength-of-connection  |
 | **Strength**    | N/A             | `aggregation_eps_decay`    | `float` | `0.5`   | Per-level multiplier for strength threshold     |
+| **Pointwise**   | `block_size`    | `aggregation_block_size`   | `int`   | `1`     | Interleaved unknowns per node of a scalar fine matrix (BSR uses its block size) |
 | **Smoothing**   | `relax`         | `sa_relaxation_factor`     | `float` | `0.67`  | Jacobi prolongator relaxation multiplier        |
 | **Smoothing**   | `power_iters`   | `sa_spectral_radius_iters` | `int`   | `4`     | Power iteration steps for $\rho(D^{-1}A^F)$     |
 | **Truncation**  | `eps_drop`      | `sa_prolongator_drop_tol`  | `float` | `0.02`  | Drop threshold for smoothed prolongator entries |
-| **Over-Interp** | `over_interp`   | `aggregation_over_interp`  | `float` | `1.5`   | Galerkin coarse scaling factor $\alpha$         |
+| **Over-Interp** | `over_interp`   | `aggregation_over_interp`  | `float` | `1.0`   | Galerkin coarse scaling factor $\alpha$ (AMGCL uses 1.5; 1.0 keeps existing `AGGREGATION` configs unchanged) |
+| **ILUT**        | `tau`           | `ilut_drop_tol`            | `float` | `1e-2`  | Drop entries not above $\tau \sum_j |a_{ij}| / \mathrm{nnz}_{\mathrm{off}}(a_i)$ |
+| **ILUT**        | `p`             | `ilut_fill_factor`         | `float` | `2`     | Keep at most $p \cdot$ nnz of the lower/upper part of $a_i$ per factor row |
+| **ILUP**        | `k`             | `ilup_fill_level`          | `int`   | `1`     | ILU on the pattern of $A^{k+1}$ (0 = ILU(0))    |
+| **ILU**         | N/A             | `ilu_factor_sweeps`        | `int`   | `-1`    | ParILU/ParILUT fixed-point sweeps; -1 = variant default (ILUP 30, ILUT 10) |
+| **ILU**         | `solve.iters`   | `ilu_solve_iters`          | `int`   | `2`     | Jacobi iterations per triangular solve          |
+| **ILU**         | `solve.damping` | `ilu_solve_damping`        | `float` | `0.72`  | Damping of the Jacobi triangular solves         |
+| **ILU**         | N/A             | `ilu_solve_method`         | `enum`  | `JACOBI`| `JACOBI` (approximate, graph-safe) or `CUSPARSE` (exact SpSV) |
 | **Krylov**      | `L`             | `bicgstab_l`               | `int`   | `2`     | Polynomial order for BiCGStab(L)                |
-| **Krylov**      | `k`             | `lgmres_augmentation_k`    | `int`   | `3`     | Number of augmentation vectors for LGMRES       |
+| **Krylov**      | `k`             | `lgmres_augmentation_k`    | `int`   | `3`     | Augmentation vectors of LGMRES; the basis is `gmres_n_restart` + K, as AMGCL's $M + K$ |
+| **Aggregation** | N/A (greedy order) | `aggregation_mis_priority` | `enum` | `HASH` | SA MIS(2) seed priority; `INDEX` gives AMGCL's greedy seeds |
 | **CPR**         | `eps_dd`        | `cpr_diag_dominant_tol`    | `float` | `0.2`   | Diagonal dominance threshold for DRS            |
-| **CPR**         | `block_size`    | `cpr_block_dim`            | `int`   | `3`     | Dimension of coupled system block               |
+| **CPR**         | `eps_ps`        | `cpr_pressure_coupling_tol`| `float` | `0.02`  | Pressure-coupling threshold for DRS             |
+| **CPR**         | `weights`       | `cpr_drs_weights`          | `string`| empty   | Comma-separated per-component DRS weights (AMGCL takes one per row) |
+| **CPR**         | `block_size`    | `cpr_block_dim`            | `int`   | `3`     | Unknowns per cell of a scalar matrix, pressure first (BSR uses its block size) |
+| **CPR**         | N/A (`cpr` vs `cpr_drs`) | `cpr_decoupling`  | `enum`  | `DRS`   | `DRS` or `QUASI_IMPES` restriction weights      |
+| **CPR**         | `pprecond`      | `cpr_pressure_solver`      | solver  | `AMG`   | Solver of the pressure matrix $A_{pp}$          |
+| **CPR**         | `sprecond`      | `cpr_global_smoother`      | solver  | `MULTICOLOR_DILU` | Global first stage on the full system  |
+| **Schur**       | `pmask`         | `schur_pmask_pattern` / `AMGX_matrix_set_row_markers` | `string` | empty | `%start:stride`, `>start`, `<end` (JSON) or `stride.S.T`, `tail.S`, `head.E` |
+| **Schur**       | `type`          | `schur_variant`            | `int`   | `1`     | 1 pressure correction (U, P, U), 2 block triangular (P, U) |
+| **Schur**       | `adjust_p`      | `schur_adjust_p`           | `int`   | `2`     | Pressure matrix $K_{pp}$, $K_{pp} - \mathrm{diag}(K_{pu} M K_{up})$, $K_{pp} - K_{pu} M K_{up}$ |
+| **Schur**       | `simplec_dia`   | `schur_simplec_dia`        | `int`   | `1`     | $M = 1/\sum_j |K_{uu,ij}|$ (1) or $\mathrm{diag}(K_{uu})^{-1}$ (0) |
+| **Schur**       | `usolver` / `psolver` | `schur_velocity_solver` / `schur_pressure_solver` | solver | `AMG` | Velocity and pressure block solvers |
+| **Deflation**   | `vec`, `nvec`   | `AMGX_matrix_set_deflation_vectors` | API | — | Deflation vectors $Z$ (column per vector) |
+| **Deflation**   | N/A             | `deflation_use_nullspace`  | `int`   | `0`     | Deflate the near-nullspace of `AMGX_matrix_set_nullspace` instead |
+| **Reorder**     | `adapter::reorder` | `reordering`            | `enum`  | `NONE`  | `RCM`: reverse Cuthill-McKee of the system before setup (top-level scope, single GPU) |
+| **Rebuild**     | `allow_rebuild` | `numeric_rebuild`          | `int`   | `1`     | With `structure_reuse_levels != 0`, recompute only the values of $AP$ and $RAP$ (SA and CLASSICAL) |
 
 ---
 
-## 4. Non-Goals and Decisions Taken
+## 5. Non-Goals and Decisions Taken
 
 1. **No Sequential AMGCL Fallback Kernels on GPU:**
    
@@ -417,3 +254,168 @@ To maintain ergonomic parity with AMGCL while integrating cleanly into AMGX, all
    
    - *Decision:* Any new solver or smoother module added must contain an allocation-free execution path during the solve phase.
    - *Reason:* In-flight dynamic memory allocations (`cudaMalloc`) or asynchronous host-device synchronizations (`cudaMemcpy` with host polling) break CUDA Graph capture, which is essential for low-latency inference and transient simulation loops.
+
+8. **Smoothed Aggregation Probes Use AMGCL as the Baseline:**
+   
+   - *Decision:* The Stage 1/2 probes were restated as parity with AMGCL 1.4.3 (Kratos copy), run on the same matrices with the same smoother class. The absolute thresholds in the original text were dropped where AMGCL itself does not meet them:
+     - V(1,1) factor $\rho \le 0.18$: AMGCL gets 0.52–0.68.
+     - Biharmonic in $\le 25$ iterations: AMGCL needs 112–1000. It needs a linear-mode nullspace.
+     - Power iteration within 1% in 4 steps: impossible as the spectral gap tends to 0.
+     - Untruncated operator complexity above $2.5\times$: measured 1.04–1.46.
+     - Over-interpolation saving $\ge 25\%$: AMGCL saves 20–22%, AMGX 8–18%. A standalone V-cycle with $\alpha = 1.5$ diverges in both.
+   - *Reason:* A threshold that the reference implementation misses measures the problem, not the port.
+
+9. **Smoothed Aggregation Design Choices:**
+   
+   - **Strength criterion:** AMGCL's code form, $a_{ij}^2 > \varepsilon^2 a_{ii} a_{jj}$, applied on the point matrix (max $|a_{ij}|$ per block, not the Frobenius norm) for systems. When a level has no strong connection (e.g. 27-point stencils, $1/26 < 0.08$), $\varepsilon$ keeps decaying instead of ending the hierarchy.
+   - **Aggregation:** a parallel deterministic distance-2 MIS on the strong graph replaces AMGCL's serial greedy pass.
+   - **Coarse levels are scalar CSR.** BSR fine matrices are expanded internally (`as_scalar`), and later levels inherit the unknowns per node, i.e. the nullspace size.
+   - **Truncation:** for one constant vector it uses row-sum rescaling (`Truncate`). For block or nullspace prolongators it applies the minimum-norm correction of the kept entries that preserves $(P B_c)_i$, and keeps the row whole when that is impossible.
+   - **Rigid-body modes** are centred and orthonormalized exactly. AMGCL's Gram-Schmidt assumes unit-norm translations, which they are not.
+   - **`aggregation_over_interp` defaults to 1.0,** so existing `AGGREGATION` configs are unchanged.
+
+10. **SPAI / ILU Smoother Design Choices and AMGCL-Baseline Probes:**
+    
+    - *Measured (P1.1),* 2D upwind convection-diffusion, global Pe = $10^4$, $128^2$ unknowns. AMGX values are exactly AMGCL's:
+      - Per-sweep Richardson factor: SPAI0 0.9968, SPAI1 0.9947.
+      - GMRES(50) iterations: SPAI0 347, SPAI1 294.
+      - Multicolor GS stalls at 1.02 per sweep.
+      - As SA V(1,1) smoothers in GMRES, AMGX does better: SPAI1 13 iterations (AMGCL 29) and SPAI0 18 (AMGCL diverges).
+    - *Measured (P1.2),* anisotropic convection-diffusion ($\varepsilon_x = 10^{-3}$), $256^2$ unknowns, GMRES(50) iterations:
+      - ILU(0): 299, the same as AMGCL once converged.
+      - ILUP(1): 149, the same as AMGCL.
+      - ILUT ($\tau = 10^{-3}$, $p = 15$, exact solves): 9, the same as AMGCL, after 20 sweeps (23 after the default 5; see P1.3).
+    - *Restated probes.* The original thresholds were replaced by these parity checks:
+      - "SPAI-1 reduces the residual tenfold per pass": AMGCL achieves 0.9947, not 0.1.
+      - "ILU0 fails to factorize": it factorizes but needs about 300 iterations against ILUT's 9.
+    - **SPAI1** solves the normal equations $(A_I A_I^T) m = A(I, i)$ per row in shared memory (warp-per-row Cholesky), with the entries taken from $C = A A^T$. This is the same minimizer as AMGCL's QR. Rows longer than 64 entries fall back to SPAI0.
+    - **ILU factorization** uses parallel fixed-point sweeps (Chow–Patel ParILU; Anzt–Chow–Dongarra ParILUT) instead of cuSPARSE `csrilu02`, which is deprecated in CUDA 13.1. ILUT uses AMGCL's dropping rule, $|v| > \tau \sum_j |a_{ij}| / \mathrm{nnz}_{\mathrm{off}}$, plus the $p\cdot$nnz cap per part.
+    - **Triangular solves.** `JACOBI` (AMGCL's GPU scheme) is allocation-free and graph-safe, but weak on strongly convective problems: 168 GMRES iterations against 7–9 exact. `CUSPARSE` (SpSV, analysis at setup) is exact.
+    - **Damping.** The smoothers honour `relaxation_factor` (AMGX default 0.9). AMGCL parity runs set it to 1.
+
+11. **Krylov Accelerators (P2): Design Choices, Complex Fixes and AMGCL-Baseline Probes:**
+    
+    - **Solvers.** `BICGSTABL` (`bicgstab_l`, default 2) and `LGMRES` (`lgmres_augmentation_k`, default 3) are right preconditioned as in AMGCL and run in real and complex modes.
+      - `BICGSTABL`: one iteration is one BiCG step, as AMGCL counts. It uses AMGCL's default convex (minimal-residual) polynomial. The `delta` reliable update is not ported; instead the true residual is checked when the recursive one claims convergence (see C1).
+      - `LGMRES`: the basis has `gmres_n_restart` Krylov plus `lgmres_augmentation_k` augmentation columns, AMGCL's $M + K$ (corrected in decision 14; the first version used `gmres_n_restart` as the total).
+    - **Complex arithmetic defects fixed in the same change.** Complex GMRES did not converge on non-Hermitian systems because of three defects:
+      - The device `amgx::dotc` called the unconjugated `cublasZdotu` (`src/blas.cu`). It now uses `Cublas::dotc`, matching the host path.
+      - GMRES orthogonalized with $\langle V_{i+1}, V_k \rangle$ instead of $V_k^H V_{i+1}$.
+      - The complex Givens rotation used a real sine that ignored the phase of $h_{ii}$. A corrected version now lives in `include/solvers/givens_rotation.h`, shared by GMRES and LGMRES.
+
+      Separately, `cuDoubleComplex` × `double`/`float` scaled only the real part (`include/amgx_types/math.h`).
+    - *Measured (P2.1),* complex Helmholtz $\kappa = 50$ with absorbing boundary, $128^2$. Iterations unpreconditioned / Jacobi, AMGX vs AMGCL:
+
+      | Solver | AMGX | AMGCL |
+      |---|---|---|
+      | BiCGStab | 1994 / 2042 (BiCGStab(1)) | breaks down (zero $\omega$) |
+      | BiCGStab(2) | 1267 / 1200 | 1244 / 1199 |
+      | BiCGStab(4) | 1001 / 940 | 1300 / 1240 |
+      | GMRES(30) | 1569 / 1512 | 1590 / 1591 |
+      | LGMRES(30,3) | 1641 / 1698 | 1648 / 1606 |
+
+      Centred convection, cell Péclet number about 4:
+      - BiCGStab(2) and BiCGStab(4) take 383–415 iterations to a true $10^{-8}$, against 1477 for BiCGStab(1).
+      - AMGCL's BiCGStab breaks down, and its BiCGStab(L) takes 275–284 iterations measured on the recursive residual.
+      - GMRES(30) takes 438 in both libraries.
+    - *Restated P2.1 probe.* "Monotone convergence of BiCGStab(L)" is not a property of the BiCGStab family in either library. With $L = 4$ the residual still rises 400–450 times on Helmholtz, though it overshoots its running minimum by more than 10× only 4–8 times. The probe became parity with AMGCL plus robustness where BiCGStab breaks down.
+    - *Measured (P2.2),* recirculating flow (`c = Pe·(sin πx cos πy, −cos πx sin πy)`), $128^2$:
+      - At Pe = 2000, unpreconditioned or Jacobi, GMRES(30) stagnates at about $10^{-1}$ in both libraries.
+      - LGMRES(30,3) breaks the stagnation, to $4.8 \times 10^{-5}$ / $4.2 \times 10^{-4}$ after 5000 iterations (AMGCL: $2.5 \times 10^{-4}$ / $4.35 \times 10^{-4}$), but does not converge.
+      - With ILU(0) at Pe = 2000, LGMRES cuts the iteration count: GMRES(20) 2458 → LGMRES(20,3) 847 (AMGCL 2496 → 847, identical once the basis sizes agree, decision 14).
+      - "Converges in < 3 restarts" is not met by either library.
+
+12. **Composite Preconditioners (P3): Design Choices and AMGCL-Baseline Probes:**
+    
+    - **Solvers.** All three are real-mode and single-GPU. Setup runs on the device through `include/composite/submatrix.h` (masked extraction, COO→CSR sort/reduce, sparse add, SpGEMM), and the apply paths allocate nothing.
+      - `CPR`: AMGCL `cpr`/`cpr_drs` apply order. The global smoother acts on the full system, then the weighted pressure residual is restricted, solved and injected into component 0.
+      - `SCHUR_PRESSURE_CORRECTION`: AMGCL types 1 and 2.
+      - `DEFLATION`: AMGCL's `deflated_solver` apply, $x = Mb$, $x \mathrel{+}= Z E^{-1} Z^T (b - Ax)$. $E = Z^T A Z$ is LU-factorized with cuSOLVER at setup.
+    - **Deviations from AMGCL:**
+      - **Schur pressure solve:** it works on the *assembled* matrix. AMGX's `Solver::setup` needs a `Matrix`, so AMGCL's matrix-free $S$ (`approx_schur = false`) is not ported. The AMGCL baseline runs with `approx_schur = true`; its default gave the same 90 iterations.
+      - **`schur_adjust_p = 1`** inserts the diagonal correction where $K_{pp}$ has no diagonal entry. AMGCL only updates existing diagonals, so with $C = 0$ its Jacobi pressure solve has zero pivots (no convergence in 300 iterations).
+      - **`schur_adjust_p = 0` with $C = 0$:** now warns at setup.
+      - **Deflation initial guess:** AMGCL projects $x_0$; a preconditioner cannot.
+      - **CPR `active_rows`** is not ported.
+      - **`cpr_drs_weights`** are per cell component; AMGCL's are per row.
+      - **The Schur pressure mask** comes from `AMGX_matrix_set_row_markers` or from `schur_pmask_pattern`. AMGCL's `%`, `>` and `<` forms work in JSON. Config strings only accept `[A-Za-z0-9=_.+-]`, so they use `stride.S.T`, `tail.S` and `head.E`.
+    - *Measured (P3.1),* SPE10 Model 2 (60×220×85, from the SPE CSP files):
+      - **Problem:** a 2-phase oil-water fully implicit TPFA Jacobian with unknowns $(p, S_w)$, 2.24M unknowns. It is built at a five-spot pressure field and an upwinded flood front with $\Delta t$ = 30 days. The right-hand side is a water rate change at the central injector.
+      - **Solver:** FGMRES(50) to $10^{-6}$.
+      - **AMGX:** CPR-DRS with classical AMG pressure and ILU(0) (30 sweeps, exact solves) takes **85 iterations** (2.4 s on RTX 2000 Ada). With an SA pressure solver it takes 188 (AMGCL with the same scalar ILU0: 205, decision 14). Quasi-IMPES stalls.
+      - **AMGCL:** `cpr_drs` with SA and block ILU0 takes **156** (25 min CPU). On the 5- and 35-layer subsets, AMGCL `cpr` (quasi-IMPES) needs 247–300.
+      - Single-stage AMGX AMG and ILU(0) do not converge in 500 iterations.
+      - The original "< 35" is missed on the full model (it is met on Upper Ness alone, 32). It is restated as AMGCL parity, which is met.
+      - Rows with $\phi < 10^{-3}$ (7% of Tarbert, 25% of Upper Ness) make rhs = 1 tests unsolvable in both libraries. Hence the physical right-hand side.
+    - *Measured (P3.2),* 3D lid-driven cavity, MAC Stokes, $C = 0$, one pressure pinned, FGMRES(50) to $10^{-6}$:
+      - **`schur_adjust_p = 2`** (the roadmap's $\hat S = B\,\mathrm{diag}(A)^{-1} B^T$) with SA AMG on $\hat S$ takes 85 iterations ($32^3$) and 130 ($48^3$). AMGCL takes 90–92. A more exact pressure solve makes it worse (187), because $\hat S$ behaves like a scaled Laplacian, whereas steady Stokes needs a mass-matrix-like approximation.
+      - **`schur_adjust_p = 1`** (diagonal) with Jacobi takes **19 ($32^3$) and 20 ($48^3$)**, mesh-independent. `src/configs/FGMRES_SCHUR_STOKES.json` uses it.
+      - Plain AMGX AMG on the full system converges in 145. It does not "error out" as the original text assumed.
+    - *Measured (P3.3):*
+      - **The original probe is ill-posed.** With 100 disjoint Neumann subdomains the indicator vectors span $\ker A$, so $E = Z^T A Z = 0$ cannot be factorized (setup reports it).
+      - **Restated problem:** 100 boxes (5×5×4, 80×80×64 = 410k unknowns) coupled by $10^{-6}$, Dirichlet on one face, $Z$ = box indicators.
+      - **With Jacobi:** PCG drops from 442 to **89** iterations with deflation (AMGCL `deflated_solver`: 442 to 88, which is parity). FGMRES(50) drops from not converging in 2000 to 117.
+      - **SA AMG** already handles the weak coupling: 17 iterations with or without deflation (AMGCL 13 / 13). The "un-deflated AMG diverges" claim does not hold.
+
+13. **Reordering and Numeric Rebuild (P5): Design Choices and Measurements:**
+    
+    - **RCM** (`include/reorder/rcm.h`, `src/reorder/rcm.cu`). It runs on the symmetrized off-diagonal pattern of the (block) matrix.
+      - Each connected component starts from a George-Liu pseudo-peripheral node.
+      - Cuthill-McKee levels are ordered by (first parent position, degree, index), then the order is reversed.
+      - AMGCL's `cuthill_mckee` (Kratos copy) starts from node 0 (which its `node > 0` test never expands), takes neighbours in column order and never reverses, so it is plain CM. The bandwidths are not comparable one to one.
+      - Levels are inherently sequential. A persistent single-block kernel sweeps them and bitonic-sorts each level of up to 1024 nodes in shared memory, with no host round trip per level. Larger levels fall back to device sorts. The diameter-66k serpentine below is reordered in 2.1–2.9 s (16.9M rows), against 20–36 s with one host round trip per level.
+    - **Placement:** `reordering=RCM` applies to the top-level `AMG_Solver`.
+      - The user's matrix is left untouched (`AMGX_matrix_replace_coefficients` writes into it in its own order). A permuted copy and an nnz map are kept, so a resetup only gathers values.
+      - b and x are permuted around the solve; norms, histories and status are unchanged.
+      - The nullspace, deflation vectors and Schur row markers follow the permutation.
+      - Distributed matrices are skipped with a warning.
+    - *Measured (P5.1),* serpentine voxel channel (16×16 cross-section, 32 legs, cells stretched 8:1, 16.9M unknowns), RTX 2000 Ada:
+      - Bandwidth goes from 1,056,512 (lexicographic over the bounding box) or 16.9M (random) to 448.
+      - CG iterations (SpMV-bound): random numbering 61.4 → 21.9 ms (2.8×).
+      - PCG + SA (Jacobi, 2+2 sweeps), 8.5M unknowns: random numbering 145.8 → 55.4 ms per iteration (2.6×).
+      - Lexicographic numbering: no gain (−2% to +3%). The bounding-box order already has the channel's locality.
+      - Problems up to about 2M unknowns show no effect, since their vectors fit in the 32 MB L2.
+      - Iteration counts stay within ±1.
+      - The L2-miss counters are P5.1.
+    - *Measured (P5.2),* 1M-row 7-point diffusion with coefficients changing every step, 20 `replace_coefficients` + `resetup` steps:
+      - **Structural reuse already exists:** with `structure_reuse_levels=-1` a resetup costs 26 ms (SA, Jacobi) or 147 ms (classical PMIS/D2), against 84 / 328 ms for a full rebuild.
+      - **Profile:** NVTX ranges `spgemm_symbolic`/`spgemm_numeric`/`smoother_setup`/`coarse_solver_setup`/`ilu_factorize` with nsys put the symbolic SpGEMM phase, including its host synchronizations, at about 60% (SA) and 66% (classical) of a resetup. That is above the 20% threshold.
+      - **Implemented:** `NumericGalerkin` (`include/numeric_galerkin.h`).
+        - At the first build with structure reuse it keeps the sorted $AP$ and $RAP$ patterns.
+        - On reuse levels it recomputes only their values. Thread groups per row are sized like `csr_galerkin_product` and accumulate with shared/global atomics; there is no symbolic pass, allocation or host sync.
+        - SA resetup goes from 26.7 to **13.7 ms (−49%)**, classical from 146.7 to **93.1 ms (−37%)**, with identical iteration counts.
+        - The first setup costs more because of the pattern sort: 0.14 → 0.16 s (SA), 0.39 → 0.52 s (classical).
+        - `numeric_rebuild=0` restores the old path.
+      - **AMGCL reference (CPU, same sequence):** `rebuild()` takes 229 ms against 395 ms for a full setup.
+      - **Not changed:**
+        - Smoother and coarse-solver setup stay under 2% of a resetup with Jacobi/DILU.
+        - With ILUP the resetup is dominated by the factorization itself (P1.3).
+        - P and R stay those of the first matrix on reuse levels (SA: the smoothing is not redone), as in AMGCL's `rebuild()`.
+
+14. **Correctness Debts and Open Items (C1, C2, P0.13, P1.3, P2.3):**
+    
+    - **C1 (fixed).** `PBICGSTAB` and `BICGSTAB` confirm every convergence claim with the true residual $b - Ax$ and restart the recurrences from it otherwise (residual replacement).
+      - Both exits are covered: the half-step exit on $\|s\|$ and the end of the iteration.
+      - `BICGSTAB` also tested the norm of $s$ instead of $r$ at the end of the step, and skipped restoring the matrix view.
+      - On the C1 probe all variants now stop at a true $8.2 \times 10^{-9}$ after 1507 iterations; before, they reported SUCCESS at $1.06 \times 10^{-2}$. `KrylovP2Solvers` checks this.
+    - **C2 (not a defect).** The probe matrix was indefinite: its diagonal blocks $d I + 0.01 d (J - I)$ make $x = (u, -u, 0)$ a negative direction. `MULTICOLOR_GS` was also run without `symmetric_GS`, which is not valid in PCG.
+      - On an SPD version, SA converges in 12 (Jacobi), 9 (`MULTICOLOR_DILU`) and 8 (symmetric `MULTICOLOR_GS`) iterations. AGGREGATION takes 21 / 13 / 13.
+      - `compute-sanitizer` is clean.
+      - The `max_levels=1` "kernel launch error" was a 275 GB dense coarse matrix. `DENSE_LU_SOLVER` now reports it as `AMGX_ERR_NO_MEMORY` with the size and the free memory.
+    - **P0.13 (closed).** Against a like-for-like AMGCL baseline (`cpr_drs` with scalar ILU0, as the AMGX run uses), full SPE10 takes 205 iterations in AMGCL and 188 in AMGX's SA pressure solver. The earlier 156 used AMGCL's block ILU0.
+      - The aggregation density was not the cause. `aggregation_mis_priority=INDEX` (the lexicographically first MIS(2), i.e. AMGCL's greedy seeds; the unit test checks it against a host greedy pass) matches AMGCL's level-1 size: 14288 vs 14316 rows, against 12314 with HASH.
+      - With INDEX the SPE10 iterations are mixed: 45 → 50 (5 layers), 361 → 172 (Upper Ness), 188 → 274 (full model).
+      - INDEX converges better on the P0 Poisson probes: aniso7 64³ 23 → 16 (AMGCL 17), poisson7 64³ 20 → 17 (AMGCL 17), aniso7 128³ 27 → 18. But its round count grows with the dependency chains of the index order, so setup is 1.2–1.6× at 64³ and 2.6–4.4× at 128³. HASH stays the default.
+    - **P1.3 (redesigned; ParILUT throughput open).** The factorization now keeps a persistent row-sorted pattern `ParILUFactor` (`include/solvers/parilu.h`).
+      - **Sweeps:** each sweep is one deterministic thread-per-entry kernel (binary searches in sorted rows; no SpGEMM, sort, allocation or sync).
+      - **ILUP** keeps its pattern and refactors values only when A's pattern is unchanged; the cuSPARSE solve then refreshes in place (`cusparseSpSV_updateMatrix`).
+      - **ParILUT steps** generate candidates with one bit-limited radix sort and select with per-entry ranks.
+      - **Results** (iterations unchanged everywhere):
+        - ILUP(0)/(1) setup inside SA (1M rows): 0.77 → 0.20 s and 9.7 → 1.07 s.
+        - ILUP resetup with `structure_reuse_levels=-1`: 521 → 43 ms and 6.9 → 0.61 s.
+        - CPR setup on full SPE10 (ILU(0), 30 sweeps): 5.8 → 0.91 s.
+        - ParILUT (65k probe, 20 sweeps): 0.688 → 0.229 s.
+      - **Sweep defaults** are now per variant (`ilu_factor_sweeps=-1`): ILUP 30, because extra ILUP sweeps cost almost nothing (+7 ms for 60 on 65k rows) and SPE10 needs 30; ILUT 10 (12 iterations for 0.09 s).
+    - **P2.3 (not a defect).** AMGCL's LGMRES basis holds $M + K$ columns; AMGX used `gmres_n_restart` as the total. AMGX LGMRES(20,3) was therefore AMGCL's (17,3), which stalls identically in AMGCL: 0.918 after 3000 iterations, and (13,3) / (7,3) match AMGX (16,3) / (10,3) at 0.964 / 0.995.
+      - With the basis now `gmres_n_restart` + K, LGMRES(20,3) with ILU(0) at Pe = 5000 takes **874** iterations (AMGCL 874, the same residual $9.09 \times 10^{-9}$); (30,3) takes 660 (AMGCL 660); Pe = 2000 takes 847 (AMGCL 847).
+      - The inexact 5-sweep ILU(0) was not the cause: 30 and 60 sweeps stall the same way under the old sizes.
