@@ -36,6 +36,8 @@
 #include <solvers/idr_solver.h>
 #include <solvers/idrmsync_solver.h>
 #include <solvers/pbicgstab_solver.h>
+#include <solvers/bicgstabl_solver.h>
+#include <solvers/lgmres_solver.h>
 #include <solvers/bicgstab_solver.h>
 #include <solvers/fgmres_solver.h>
 #include <solvers/gmres_solver.h>
@@ -381,9 +383,9 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("block_convert", "asks the reader to perform conversion to block matrix. <0>: do not perform conversion, <block_dim>: convert to (block_dim)x(block_dim) block matrix", 0);
     //Register Solver/Preconditioner/Smoother Parameters
     std::vector<std::string> solver_values = getAllSolvers();
-    AMG_Config::registerParameter<std::string>("solver", "the solving algorithm <AMG|PCG|PCGF|PBICGSTAB|GMRES|FGMRES|JACOBI_L1|BLOCK_JACOBI|GS|MULTICOLOR_GS|MULTICOLOR_ILU|MULTICOLOR_DILU|SPAI0|SPAI1|ILUT|ILUP|KACZMARZ|NOSOLVER>", "AMG", solver_values);
-    AMG_Config::registerParameter<std::string>("preconditioner", "the preconditioner algorithm <AMG|PCG|PCGF|PBICGSTAB|GMRES|FGMRES|JACOBI_L1|BLOCK_JACOBI|GS|MULTICOLOR_GS|MULTICOLOR_ILU|MULTICOLOR_DILU|SPAI0|SPAI1|ILUT|ILUP|NOSOLVER>", "AMG", solver_values);
-    AMG_Config::registerParameter<std::string>("coarse_solver", "the solving algorithm <AMG|PCG|PCGF|PBICGSTAB|GMRES|FGMRES|JACOBI_L1|BLOCK_JACOBI|GS|MULTICOLOR_GS|MULTICOLOR_ILU|MULTICOLOR_DILU|SPAI0|SPAI1|ILUT|ILUP|NOSOLVER>", "DENSE_LU_SOLVER", solver_values);
+    AMG_Config::registerParameter<std::string>("solver", "the solving algorithm <AMG|PCG|PCGF|PBICGSTAB|BICGSTABL|GMRES|LGMRES|FGMRES|JACOBI_L1|BLOCK_JACOBI|GS|MULTICOLOR_GS|MULTICOLOR_ILU|MULTICOLOR_DILU|SPAI0|SPAI1|ILUT|ILUP|KACZMARZ|NOSOLVER>", "AMG", solver_values);
+    AMG_Config::registerParameter<std::string>("preconditioner", "the preconditioner algorithm <AMG|PCG|PCGF|PBICGSTAB|BICGSTABL|GMRES|LGMRES|FGMRES|JACOBI_L1|BLOCK_JACOBI|GS|MULTICOLOR_GS|MULTICOLOR_ILU|MULTICOLOR_DILU|SPAI0|SPAI1|ILUT|ILUP|NOSOLVER>", "AMG", solver_values);
+    AMG_Config::registerParameter<std::string>("coarse_solver", "the solving algorithm <AMG|PCG|PCGF|PBICGSTAB|BICGSTABL|GMRES|LGMRES|FGMRES|JACOBI_L1|BLOCK_JACOBI|GS|MULTICOLOR_GS|MULTICOLOR_ILU|MULTICOLOR_DILU|SPAI0|SPAI1|ILUT|ILUP|NOSOLVER>", "DENSE_LU_SOLVER", solver_values);
     //AMG_Config::registerParameter< std::vector<std::string> >("smoother","the smoothing algorithm <BLOCK_JACOBI>",std::vector<std::string>(1, std::string("BLOCK_JACOBI")));
     AMG_Config::registerParameter<std::string>("smoother", "the smoothing algorithm <BLOCK_JACOBI>", "BLOCK_JACOBI", solver_values);
     //AMG_Config::registerParameter<std::string>("smoother_amg_list","list of smoothers that will be applied to the AMG hierarchy <BLOCK_JACOBI>","BLOCK_JACOBI", solver_values);
@@ -391,6 +393,8 @@ inline void registerParameters()
     AMG_Config::registerParameter<std::string>("coarse_smoother", "the smoothing algorithm <BLOCK_JACOBI>", "BLOCK_JACOBI", solver_values);
     //[F]GMRES
     AMG_Config::registerParameter<int>("gmres_n_restart", "the number of Krylov vectors used in FGMRES or GMRES solver ", 20);
+    AMG_Config::registerParameter<int>("bicgstab_l", "BICGSTABL: degree L of the minimal residual polynomial of BiCGStab(L)", 2, 1, 8);
+    AMG_Config::registerParameter<int>("lgmres_augmentation_k", "LGMRES: number of previous corrections that augment each restart cycle (gmres_n_restart is the total basis size)", 3, 0, 20);
     AMG_Config::registerParameter<int>("gmres_krylov_dim", "maximum size fo the krylov subspace. Can be smaller than restart, in that case the algorithm minimizes the quasi residual (QGMRES). Set to zero to automatically match the restart <0>", 0);
     //IDR
     AMG_Config::registerParameter<int>("subspace_dim_s", "the number of dimensions of the small system ", 8);
@@ -588,6 +592,8 @@ struct registerClasses<T_Config, true>
         //Preconditioners
         SolverFactory<T_Config>::registerFactory("BLOCK_JACOBI", new block_jacobi_solver::BlockJacobiSolverFactory<T_Config>);
         SolverFactory<T_Config>::registerFactory("GMRES", new GMRES_SolverFactory<T_Config>);
+        SolverFactory<T_Config>::registerFactory("LGMRES", new LGMRES_SolverFactory<T_Config>);
+        SolverFactory<T_Config>::registerFactory("BICGSTABL", new BiCGStabL_SolverFactory<T_Config>);
         //No Solver
         SolverFactory<T_Config>::registerFactory("NOSOLVER", new Dummy_SolverFactory<T_Config>);
         aggregation::SelectorFactory<T_Config>::registerFactory("SIZE_8", new aggregation::size8_selector::Size8SelectorFactory<T_Config>);
@@ -624,6 +630,8 @@ struct registerClasses<T_Config, false>
         SolverFactory<T_Config>::registerFactory("BICGSTAB", new BiCGStab_SolverFactory<T_Config>);
         SolverFactory<T_Config>::registerFactory("PBICGSTAB", new PBiCGStab_SolverFactory<T_Config>);
         SolverFactory<T_Config>::registerFactory("GMRES", new GMRES_SolverFactory<T_Config>);
+        SolverFactory<T_Config>::registerFactory("LGMRES", new LGMRES_SolverFactory<T_Config>);
+        SolverFactory<T_Config>::registerFactory("BICGSTABL", new BiCGStabL_SolverFactory<T_Config>);
         SolverFactory<T_Config>::registerFactory("FGMRES", new FGMRES_SolverFactory<T_Config>);
         SolverFactory<T_Config>::registerFactory("IDR", new idr_solver::IDR_SolverFactory<T_Config>); //not exposed
         SolverFactory<T_Config>::registerFactory("IDRMSYNC", new idrmsync_solver::IDRMSYNC_SolverFactory<T_Config>); //not exposed

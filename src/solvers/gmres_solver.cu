@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <solvers/gmres_solver.h>
+#include <solvers/givens_rotation.h>
 #include <blas.h>
 #include <multiply.h>
 #include <cusp/blas.h>
@@ -117,98 +118,6 @@ GMRES_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
     this->m_A->setView(oldView);
 }
 
-template <typename ValueType, bool IsComplex>
-struct GeneratePlaneRotation;
-
-template <typename ValueType>
-struct GeneratePlaneRotation<ValueType, false>
-{
-    static __host__ void generate( ValueType &dx, ValueType &dy, ValueType &cs, ValueType &sn, ValueType &rhsx, ValueType &rhsy )
-    {
-        ValueType tmp;
-
-        if (dy < ValueType(0.0))
-        {
-            cs = 1.0;
-            sn = 0.0;
-        }
-        else if (abs(dy) > abs(dx))
-        {
-            tmp = dx / dy;
-            sn = ValueType(1.0) / sqrt(ValueType(1.0) + tmp * tmp);
-            cs = tmp * sn;
-        }
-        else
-        {
-            tmp = dy / dx;
-            cs = ValueType(1.0) / sqrt(ValueType(1.0) + tmp * tmp);
-            sn = tmp * cs;
-        }
-
-        tmp   =  cs * rhsx;
-        rhsy  = -sn * rhsx;
-        rhsx  = tmp;
-    }
-};
-
-
-
-template <typename ValueType>
-struct GeneratePlaneRotation<ValueType, true>
-{
-    static __host__ void generate( ValueType &dx, ValueType &dy, ValueType &cs, ValueType &sn, ValueType &rhsx, ValueType &rhsy )
-    {
-        typedef typename types::PODTypes<ValueType>::type PodTypeB;
-        ValueType tmp;
-        PodTypeB adx = types::util<ValueType>::abs(dx);
-        PodTypeB ady = types::util<ValueType>::abs(dy);
-
-        if (isCloseToZero(dx + dy))
-        {
-            cs = types::util<ValueType>::get_one();
-            sn = types::util<ValueType>::get_zero();
-        }
-        else if (ady > adx)
-        {
-            adx = adx / ady;
-            sn = types::util<ValueType>::get_one() / sqrt(PodTypeB(1.0) + adx * adx);
-            cs = sn * adx;
-        }
-        else
-        {
-            ady = ady / adx;
-            cs = types::util<ValueType>::get_one() / sqrt(PodTypeB(1.0) + ady * ady);
-            sn = cs * ady;
-        }
-
-        tmp   = cs * rhsx;
-        rhsy  = types::util<ValueType>::invert(types::util<ValueType>::conjugate(sn)) * rhsx; //-conjugate(sin)
-        rhsx  = tmp;
-    }
-};
-
-
-template <typename ValueType>
-static __host__ void PlaneRotation( cusp::array2d<ValueType, cusp::host_memory, cusp::column_major> &H,
-                                    cusp::array1d<ValueType, cusp::host_memory> &cs,
-                                    cusp::array1d<ValueType, cusp::host_memory> &sn,
-                                    cusp::array1d<ValueType, cusp::host_memory> &s,
-                                    int i)
-{
-    ValueType temp;
-
-    for (int k = 0; k < i; k++)
-    {
-        temp     =  cs[k] * H(k,  i) +                                   sn[k] * H(k + 1, i);
-        H(k + 1, i) =  cs[k] * H(k + 1, i) - types::util<ValueType>::conjugate(sn[k]) * H(k, i);
-        H(k, i)   = temp;
-    }
-
-    GeneratePlaneRotation<ValueType, types::util<ValueType>::is_complex>::generate(H(i, i), H(i + 1, i), cs[i], sn[i], s[i], s[i + 1]);
-    H(i, i) = cs[i] * H(i, i) + sn[i] * H(i + 1, i);
-    H(i + 1, i) = types::util<ValueType>::get_zero();
-}
-
 template<class T_Config>
 void
 GMRES_Solver<T_Config>::solve_init( VVector &b, VVector &x, bool xIsZero )
@@ -248,7 +157,7 @@ GMRES_Solver<T_Config>::solve_one_iteration( VVector &b, VVector &x )
     A.apply(m_Z_vector, m_V_vectors[1]);
     // Modified Gram-Schmidt
     //  H(k,i) = <V(i+1),V(k)>    //
-    m_H(0, 0) = dot(A, m_V_vectors[1], m_V_vectors[0]);
+    m_H(0, 0) = dot(A, m_V_vectors[0], m_V_vectors[1]);
     // V(i+1) -= H(k, i) * V(k)  //
     axpy( m_V_vectors[0], m_V_vectors[1], types::util<ValueTypeB>::invert(m_H(0, 0)), offset, size );
     m_H(1, 0) = types::util<ValueTypeB>::get_one() * get_norm(A, m_V_vectors[1], L2);
@@ -326,8 +235,8 @@ GMRES_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZero )
     // Modified Gram-Schmidt
     for ( int k = 0; k <= i; ++k )
     {
-        //  H(k,i) = <V(i+1),V(k)>    //
-        m_H(k, i) = dot(A, m_V_vectors[i + 1], m_V_vectors[k]);
+        //  H(k,i) = <V(k),V(i+1)> = V(k)^H V(i+1)    //
+        m_H(k, i) = dot(A, m_V_vectors[k], m_V_vectors[i + 1]);
         // V(i+1) -= H(k, i) * V(k)  //
         axpy( m_V_vectors[k], m_V_vectors[i + 1], types::util<ValueTypeB>::invert(m_H(k, i)), offset, size );
     }

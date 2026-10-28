@@ -117,11 +117,11 @@ __host__ __device__ __inline__ cuDoubleComplex operator*(const cuDoubleComplex &
 }
 __host__ __device__ __inline__ cuDoubleComplex operator*(const cuDoubleComplex &lhs, const float &rhs)
 {
-    return make_cuDoubleComplex(cuCreal(lhs) * rhs, cuCimag(lhs));
+    return make_cuDoubleComplex(cuCreal(lhs) * rhs, cuCimag(lhs) * rhs);
 }
 __host__ __device__ __inline__ cuDoubleComplex operator*(const cuDoubleComplex &lhs, const double &rhs)
 {
-    return make_cuDoubleComplex(cuCreal(lhs) * rhs, cuCimag(lhs));
+    return make_cuDoubleComplex(cuCreal(lhs) * rhs, cuCimag(lhs) * rhs);
 }
 
 // div operator
