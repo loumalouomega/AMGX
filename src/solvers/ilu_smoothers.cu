@@ -33,6 +33,11 @@ ParILUSolver_Base<T_Config>::ParILUSolver_Base(AMG_Config &cfg, const std::strin
     m_fill_factor = cfg.AMG_Config::template getParameter<double>("ilut_fill_factor", cfg_scope);
     m_fill_level = cfg.AMG_Config::template getParameter<int>("ilup_fill_level", cfg_scope);
     m_sweeps = cfg.AMG_Config::template getParameter<int>("ilu_factor_sweeps", cfg_scope);
+
+    // Variant defaults (decision 14): ParILU sweeps are cheap and hard problems need many; ParILUT
+    // sweeps cost more and saturate earlier
+    if (m_sweeps < 1) { m_sweeps = variant == ILUP ? 30 : 10; }
+
     m_solve_method = cfg.AMG_Config::template getParameter<std::string>("ilu_solve_method", cfg_scope) == "CUSPARSE" ? 1 : 0;
     m_solve_iters = cfg.AMG_Config::template getParameter<int>("ilu_solve_iters", cfg_scope);
     m_solve_damping = cfg.AMG_Config::template getParameter<double>("ilu_solve_damping", cfg_scope);
@@ -60,8 +65,8 @@ void ParILUSolver_Base<T_Config>::solver_setup(bool reuse_matrix_structure)
         FatalError("ILUT/ILUP smoothers are not implemented for distributed matrices", AMGX_ERR_NOT_IMPLEMENTED);
     }
 
-    // The pattern of the factors depends on the values (ILUT) or is cheap to rebuild (ILUP):
-    // a structure-reuse setup factorizes again from scratch.
+    // ILUP keeps its pattern and refactors with new values when A's pattern is unchanged; the ILUT
+    // pattern depends on the values and is rebuilt.
     factorize(A);
     m_r.resize(A.get_num_rows());
     m_z.resize(A.get_num_rows());
@@ -124,21 +129,31 @@ void ParILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
     const Matrix<TConfig> &As = A.hasProps(DIAG) ? A_expanded : A;
 
     nvtxRange *factor_nr = new nvtxRange("ilu_factorize");
+    // ILUP on the pattern of the previous setup (e.g. after replace_coefficients): values only
+    const bool refactor = this->m_variant == Base::ILUP && this->m_factor.samePattern(As);
 
-    if (this->m_variant == Base::ILUP)
+    if (refactor)
     {
-        ParILU<TConfig>::factorPowerPattern(As, this->m_fill_level, this->m_sweeps, this->m_L, this->m_U);
+        this->m_factor.refactorPower(As, this->m_sweeps, this->m_L, this->m_U);
+    }
+    else if (this->m_variant == Base::ILUP)
+    {
+        this->m_factor.factorPower(As, this->m_fill_level, this->m_sweeps, this->m_L, this->m_U);
     }
     else
     {
-        ParILU<TConfig>::factorThreshold(As, this->m_drop_tol, this->m_fill_factor, this->m_sweeps, this->m_L, this->m_U);
+        this->m_factor.factorThreshold(As, this->m_drop_tol, this->m_fill_factor, this->m_sweeps, this->m_L, this->m_U);
     }
 
     delete factor_nr;
     nvtxRange solve_nr("ilu_solve_setup");
-    m_solve.setup(this->m_L, this->m_U,
-                  this->m_solve_method == 1 ? ILUTriangularSolve<TConfig>::CUSPARSE : ILUTriangularSolve<TConfig>::JACOBI,
-                  this->m_solve_iters, this->m_solve_damping);
+    const typename ILUTriangularSolve<TConfig>::Method method =
+        this->m_solve_method == 1 ? ILUTriangularSolve<TConfig>::CUSPARSE : ILUTriangularSolve<TConfig>::JACOBI;
+
+    if (!(refactor && m_solve.refresh(this->m_L, this->m_U)))
+    {
+        m_solve.setup(this->m_L, this->m_U, method, this->m_solve_iters, this->m_solve_damping);
+    }
 }
 
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>

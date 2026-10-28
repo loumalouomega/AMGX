@@ -69,6 +69,7 @@ class ParILUSolver_Base : public Solver<T_Config>
         int m_solve_iters;
         double m_solve_damping;
         Matrix<TConfig> m_L, m_U;
+        ParILUFactor<TConfig> m_factor;   // kept between setups: ILUP refactors on an unchanged pattern
         VVector m_r, m_z;
 };
 

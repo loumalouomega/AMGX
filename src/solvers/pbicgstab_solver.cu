@@ -126,12 +126,42 @@ PBiCGStab_Solver<T_Config>::solve_init( VVector &b, VVector &x, bool xIsZero )
     this->m_A->getOffsetAndSizeForView(this->m_A->getViewExterior(), &offset, &size);
     // Make sure the residual has previously been computed.
     assert( (this->m_r) && (this->m_r->size() == size * this->m_r->get_block_size()) );
+    restart();
+}
+
+template<class T_Config>
+void
+PBiCGStab_Solver<T_Config>::restart()
+{
+    int offset, size;
+    this->m_A->getOffsetAndSizeForView(this->m_A->getViewExterior(), &offset, &size);
     // r_tilde = r. TODO: use a random vector as r_star.
     copy( *this->m_r, m_r_tilde, offset, size );
     // Set rho to <r, r_tilde>.
     m_rho = dot(*this->m_A, m_r_tilde, *this->m_r);
     // p = r.
     copy( *this->m_r, m_p, offset, size );
+}
+
+template<class T_Config>
+AMGX_STATUS
+PBiCGStab_Solver<T_Config>::confirmConvergence( VVector &b, VVector &x, AMGX_STATUS claimed )
+{
+    if ( claimed != AMGX_ST_CONVERGED )
+    {
+        return claimed;
+    }
+
+    this->compute_residual( b, x );
+    this->compute_norm();
+    const AMGX_STATUS status = this->converged();
+
+    if ( !isDone( status ) )
+    {
+        restart();
+    }
+
+    return status;
 }
 
 //launches a single standard cycle
@@ -185,8 +215,7 @@ PBiCGStab_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZer
          isDone( ( conv_stat = this->compute_norm_and_converged( m_s, m_s_norm ) ) ) )
     {
         axpby( x, m_Mp, x, ValueTypeB(1), alpha, offset, size );
-        this->compute_residual( b, x );
-        this->compute_norm();
+        conv_stat = confirmConvergence( b, x, conv_stat );
         A.setView(oldView);
         return conv_stat;
     }
@@ -232,6 +261,7 @@ PBiCGStab_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZer
     if ( this->m_monitor_convergence &&
          isDone( ( conv_stat = this->compute_norm_and_converged() ) ) )
     {
+        conv_stat = confirmConvergence( b, x, conv_stat );
         A.setView(oldView);
         return conv_stat;
     }

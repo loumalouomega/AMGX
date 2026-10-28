@@ -33,8 +33,9 @@ struct MIS2Aggregates
     typedef typename TConfig::MatPrec ValueTypeA;
     typedef Vector<typename TConfig::template setVecPrec<AMGX_vecBool>::Type> BVector;
 
+    // index_priority: lexicographically first MIS(2) (AMGCL's greedy seed order) instead of hashed priorities
     static void compute(const Matrix<TConfig> &A, const BVector &strong,
-                        IVector &aggregates, int &num_aggregates, int &num_removed);
+                        IVector &aggregates, int &num_aggregates, int &num_removed, bool index_priority = false);
 };
 
 } // namespace aggregation

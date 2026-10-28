@@ -366,12 +366,13 @@ double maxDiff(const SparseRows &X, const SparseRows &Y)
 }
 
 // Runs strength + MIS(2) aggregation on the device and returns the host aggregates
-int deviceAggregates(const Matrix_d &A_d, double eps, BVector_d &strong, MVector_d &d_f, IVector_h &agg_h, int &num_removed)
+int deviceAggregates(const Matrix_d &A_d, double eps, BVector_d &strong, MVector_d &d_f, IVector_h &agg_h, int &num_removed,
+                     bool index_priority = false)
 {
     IVector_d agg;
     int num_aggregates = 0;
     Strength_d::computeStrongConnections(A_d, eps, strong, d_f);
-    Aggregates_d::compute(A_d, strong, agg, num_aggregates, num_removed);
+    Aggregates_d::compute(A_d, strong, agg, num_aggregates, num_removed, index_priority);
     agg_h = agg;
     return num_aggregates;
 }
@@ -529,6 +530,39 @@ void run()
     Matrix_d D_d = D_h;
     UNITTEST_ASSERT_EQUAL(this->deviceAggregates(D_d, 0.08, strong, d_f, agg, removed), 0);
     UNITTEST_ASSERT_EQUAL(removed, 8);
+    // aggregation_mis_priority=INDEX: the roots are the greedy MIS(2) in index order (AMGCL's
+    // plain_aggregates seeds); roots are numbered in index order, so the k-th root is in aggregate k
+    Matrix_h G_h;
+    generatePoissonForTest(G_h, 1, 0, 7, 11, 9, 5);
+    Matrix_d G_d = G_h;
+    const int ng = G_h.get_num_rows();
+    const int naggr_index = this->deviceAggregates(G_d, 0.08, strong, d_f, agg, removed, true);
+    std::vector<int> dist(ng, 3), roots;
+
+    for (int i = 0; i < ng; i++)
+    {
+        if (dist[i] <= 2) { continue; }
+
+        roots.push_back(i);
+        dist[i] = 0;
+
+        for (int k = G_h.row_offsets[i]; k < G_h.row_offsets[i + 1]; k++)
+        {
+            const int j = G_h.col_indices[k];
+
+            if (j == i) { continue; }
+
+            dist[j] = std::min(dist[j], 1);
+
+            for (int kk = G_h.row_offsets[j]; kk < G_h.row_offsets[j + 1]; kk++) { dist[G_h.col_indices[kk]] = std::min(dist[G_h.col_indices[kk]], 2); }
+        }
+    }
+
+    UNITTEST_ASSERT_EQUAL(naggr_index, (int) roots.size());
+
+    for (size_t r = 0; r < roots.size(); r++) { UNITTEST_ASSERT_EQUAL(agg[roots[r]], (int) r); }
+
+    for (int i = 0; i < ng; i++) { UNITTEST_ASSERT_TRUE(agg[i] >= 0); }
 }
 
 DECLARE_UNITTEST_END(SAMIS2Aggregates)

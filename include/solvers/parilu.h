@@ -49,6 +49,64 @@ struct ParILU
 };
 
 /***************************************************
+ * Persistent factorization state. The pattern S of L + U is a row-sorted CSR (diagonal always
+ * present); a sweep is one kernel, one thread per entry of S, computing
+ *   l_ij = (a_ij - sum_{k<j} l_ik u_kj) / u_jj,  u_ij = a_ij - sum_{k<i} l_ik u_kj
+ * from the previous sweep's values (Chow-Patel), the sums by binary search in the rows of S, with
+ * a fixed summation order: deterministic, no sort, SpGEMM, allocation or host synchronization.
+ * ILUP keeps S and the position of each a_ij, so a refactorization on the same pattern of A only
+ * redoes the values. ParILUT steps generate the candidates A_i, S_i and U_k (k in L_i) with one
+ * key sort per step and select per row and part (rank by magnitude, column as tie-break).
+ **************************************************/
+template <class T_Config>
+class ParILUFactor
+{
+    public:
+        typedef T_Config TConfig;
+        DEFINE_VECTOR_TYPES
+        typedef typename TConfig::IndPrec IndexType;
+        typedef typename TConfig::MatPrec ValueTypeA;
+        typedef Vector<typename TConfig::template setVecPrec<AMGX_vecDouble>::Type> DVector;
+
+        ParILUFactor() : m_n(0), m_nnz(0), m_power_valid(false) {}
+
+        // ILU on the pattern of A^(level+1); the pattern is kept for refactorPower
+        void factorPower(const Matrix<TConfig> &A, int level, int sweeps, Matrix<TConfig> &L, Matrix<TConfig> &U);
+        // True if A has the pattern of the last factorPower (values may differ)
+        bool samePattern(const Matrix<TConfig> &A) const;
+        // factorPower on the kept pattern: values and sweeps only
+        void refactorPower(const Matrix<TConfig> &A, int sweeps, Matrix<TConfig> &L, Matrix<TConfig> &U);
+        // ParILUT (AMGCL dropping rule)
+        void factorThreshold(const Matrix<TConfig> &A, double drop_tol, double fill_factor, int sweeps,
+                             Matrix<TConfig> &L, Matrix<TConfig> &U);
+
+    private:
+        int m_n, m_nnz;
+        bool m_power_valid;
+        // A: sorted keys with their positions in A, row statistics, a copy of its pattern
+        I64Vector m_A_keys;
+        IVector m_A_pos, m_A_ro, m_A_ci, m_len_lower, m_len_upper;
+        MVector m_A_diag;
+        DVector m_row_norms, m_row_abs_sums;
+        // Pattern S and per-entry data
+        IVector m_ro, m_ci, m_row, m_diag, m_apos;
+        MVector m_F, m_F_old, m_aval;
+        // ParILUT work buffers (grow only)
+        I64Vector m_cand_keys, m_cand_keys_alt;
+        Vector<typename TConfig::template setVecPrec<AMGX_vecInt64>::Type> m_sort_tmp;
+        IVector m_cand_ro, m_cand_row, m_cand_ci, m_keep, m_counts;
+        MVector m_cand_vals;
+        DVector m_thresholds;
+
+        void prepareA(const Matrix<TConfig> &A);
+        void patternFromKeys(const I64Vector &keys, int nnz);
+        void gatherAValues(const Matrix<TConfig> &A);
+        void initValues();
+        void sweep();
+        void splitLU(Matrix<TConfig> &L, Matrix<TConfig> &U);
+};
+
+/***************************************************
  * Applies z = U^{-1} L^{-1} r with the factors above, either approximately with damped
  * Jacobi iterations or exactly with cuSPARSE SpSV. All buffers are allocated in setup.
  **************************************************/
@@ -64,19 +122,25 @@ class ILUTriangularSolve
 
         enum Method { JACOBI, CUSPARSE };
 
-        ILUTriangularSolve() : m_method(JACOBI), m_iters(2), m_damping(0.72), m_n(0),
+        ILUTriangularSolve() : m_L(NULL), m_U(NULL), m_L_values(NULL), m_U_values(NULL), m_L_nnz(0), m_U_nnz(0),
+            m_method(JACOBI), m_iters(2), m_damping(0.72), m_n(0),
             m_L_descr(NULL), m_U_descr(NULL), m_in_descr(NULL), m_mid_descr(NULL), m_out_descr(NULL),
             m_L_spsv(NULL), m_U_spsv(NULL) {}
         ~ILUTriangularSolve() { release(); }
 
         // L and U are kept by reference and must outlive the solver
         void setup(const Matrix<TConfig> &L, const Matrix<TConfig> &U, Method method, int iters, double damping);
+        // New values in the same L and U (same pattern and storage): cuSPARSE updates its analysis
+        // in place (cusparseSpSV_updateMatrix); returns false if a full setup is needed
+        bool refresh(const Matrix<TConfig> &L, const Matrix<TConfig> &U);
         void apply(const VVector &r, VVector &z);
 
     private:
         void release();
 
         const Matrix<TConfig> *m_L, *m_U;
+        const ValueTypeA *m_L_values, *m_U_values;
+        int m_L_nnz, m_U_nnz;
         Method m_method;
         int m_iters;
         double m_damping;

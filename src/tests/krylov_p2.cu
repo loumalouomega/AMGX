@@ -242,6 +242,12 @@ void run()
         solve(C, false, p.str(), L == 1);
     }
 
+    // C1: BiCGStab must not report success on a drifted recursive residual (solve() checks the
+    // true residual whenever the solver reports success)
+    const CRows D = convection(128, 1000.0, 600.0);
+    solve(D, false, base("PBICGSTAB", 5000) + ", main:preconditioner=NOSOLVER", true);
+    solve(D, false, base("BICGSTAB", 5000), true);
+
     // LGMRES with K = 0 is GMRES(M); augmentation does not slow it down on recirculating flow
     const CRows F = recirculation(32, 200.0);
     const std::string restart = ", main:gmres_n_restart=30";

@@ -37,10 +37,14 @@ __device__ __forceinline__ unsigned int mis2Hash(unsigned int a)
     return a;
 }
 
-// Priority key ordered lexicographically by (state, hash, index), non-negative as int64.
-__device__ __forceinline__ int64_t mis2Key(int state, int i)
+// Priority key ordered lexicographically by (state, priority, index), non-negative as int64.
+// The priority is a hash of the index, or the reversed index (index_priority): lower indices
+// first, so the rounds produce the lexicographically first MIS(2), i.e. the seeds of a greedy pass
+// in index order as AMGCL's plain_aggregates (exact below 2^29 rows).
+__device__ __forceinline__ int64_t mis2Key(int state, int i, bool index_priority)
 {
-    return ((int64_t) state << 61) | ((int64_t)(mis2Hash(i) & 0x1FFFFFFF) << 32) | (int64_t) i;
+    const unsigned int p = index_priority ? (~(unsigned int) i) : mis2Hash(i);
+    return ((int64_t) state << 61) | ((int64_t)(p & 0x1FFFFFFF) << 32) | (int64_t) i;
 }
 
 template <typename IndexType>
@@ -64,18 +68,18 @@ __global__ void initStateKernel(const IndexType *row_offsets, const bool *strong
 // k1[i] = max key over i and its strong neighbours
 template <typename IndexType>
 __global__ void maxKeyRing1Kernel(const IndexType *row_offsets, const IndexType *col_indices,
-                                  const bool *strong, const int *state, int num_rows, int64_t *k1)
+                                  const bool *strong, const int *state, int num_rows, bool index_priority, int64_t *k1)
 {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_rows; i += gridDim.x * blockDim.x)
     {
-        int64_t best = mis2Key(state[i], i);
+        int64_t best = mis2Key(state[i], i, index_priority);
 
         for (IndexType k = row_offsets[i]; k < row_offsets[i + 1]; k++)
         {
             if (strong[k])
             {
                 const IndexType c = col_indices[k];
-                const int64_t key = mis2Key(state[c], c);
+                const int64_t key = mis2Key(state[c], c, index_priority);
                 best = key > best ? key : best;
             }
         }
@@ -115,7 +119,7 @@ __global__ void maxKeyRing2AndUpdateKernel(const IndexType *row_offsets, const I
 template <typename IndexType>
 __global__ void assignToRootsKernel(const IndexType *row_offsets, const IndexType *col_indices,
                                     const bool *strong, const int *state, const int *root_id,
-                                    int num_rows, int *aggregates)
+                                    int num_rows, bool index_priority, int *aggregates)
 {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_rows; i += gridDim.x * blockDim.x)
     {
@@ -136,7 +140,7 @@ __global__ void assignToRootsKernel(const IndexType *row_offsets, const IndexTyp
 
             if (strong[k] && state[c] == MIS2_IN)
             {
-                const int64_t key = mis2Key(MIS2_IN, c);
+                const int64_t key = mis2Key(MIS2_IN, c, index_priority);
 
                 if (key > best) { best = key; best_col = c; }
             }
@@ -149,7 +153,7 @@ __global__ void assignToRootsKernel(const IndexType *row_offsets, const IndexTyp
 // Remaining nodes join the aggregate of the highest priority neighbour assigned in the previous pass.
 template <typename IndexType>
 __global__ void assignToNeighboursKernel(const IndexType *row_offsets, const IndexType *col_indices,
-        const bool *strong, const int *aggregates_in, int num_rows, int *aggregates_out)
+        const bool *strong, const int *aggregates_in, int num_rows, bool index_priority, int *aggregates_out)
 {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_rows; i += gridDim.x * blockDim.x)
     {
@@ -166,7 +170,7 @@ __global__ void assignToNeighboursKernel(const IndexType *row_offsets, const Ind
 
                 if (strong[k] && aggregates_in[c] >= 0)
                 {
-                    const int64_t key = mis2Key(0, c);
+                    const int64_t key = mis2Key(0, c, index_priority);
 
                     if (key > best) { best = key; agg = aggregates_in[c]; }
                 }
@@ -193,7 +197,7 @@ struct mis2_in_flag
 
 template <class T_Config>
 void MIS2Aggregates<T_Config>::compute(const Matrix<TConfig> &A, const BVector &strong,
-                                       IVector &aggregates, int &num_aggregates, int &num_removed)
+                                       IVector &aggregates, int &num_aggregates, int &num_removed, bool index_priority)
 {
     const int num_rows = A.get_num_rows();
     aggregates.resize(num_rows);
@@ -215,7 +219,7 @@ void MIS2Aggregates<T_Config>::compute(const Matrix<TConfig> &A, const BVector &
     while (thrust_wrapper::count_if<TConfig::memSpace>(state.begin(), state.end(), is_mis2_state(MIS2_UNDECIDED)) > 0)
     {
         maxKeyRing1Kernel <<< num_blocks, MIS2_BLOCK_SIZE>>>(row_offsets, col_indices, strong.raw(),
-                state.raw(), num_rows, k1.raw());
+                state.raw(), num_rows, index_priority, k1.raw());
         cudaCheckError();
         maxKeyRing2AndUpdateKernel <<< num_blocks, MIS2_BLOCK_SIZE>>>(row_offsets, col_indices,
                 strong.raw(), k1.raw(), num_rows, state.raw());
@@ -238,11 +242,11 @@ void MIS2Aggregates<T_Config>::compute(const Matrix<TConfig> &A, const BVector &
     }
 
     assignToRootsKernel <<< num_blocks, MIS2_BLOCK_SIZE>>>(row_offsets, col_indices, strong.raw(),
-            state.raw(), root_id.raw(), num_rows, aggregates.raw());
+            state.raw(), root_id.raw(), num_rows, index_priority, aggregates.raw());
     cudaCheckError();
     // state is no longer needed, reuse it as output of the last pass
     assignToNeighboursKernel <<< num_blocks, MIS2_BLOCK_SIZE>>>(row_offsets, col_indices, strong.raw(),
-            aggregates.raw(), num_rows, state.raw());
+            aggregates.raw(), num_rows, index_priority, state.raw());
     cudaCheckError();
     thrust_wrapper::copy<TConfig::memSpace>(state.begin(), state.end(), aggregates.begin());
     cudaCheckError();

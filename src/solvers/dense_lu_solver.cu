@@ -606,7 +606,19 @@ allocMem(DataType *&ptr,
     if ( ptr != NULL ) { amgx::memory::cudaFreeAsync(ptr); }
     cudaCheckError();
 
-    size_t sz = numEntry * sizeof(DataType);
+    size_t sz = static_cast<size_t>(numEntry) * sizeof(DataType);
+    size_t free_bytes = 0, total_bytes = 0;
+
+    // The dense coarse matrix grows as rows^2: report a useful error instead of a failed launch
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess && sz > free_bytes)
+    {
+        std::stringstream ss;
+        ss << "DENSE_LU_SOLVER: the dense coarse matrix of " << m_num_rows << " rows needs "
+           << sz / (1024.0 * 1024.0 * 1024.0) << " GB but only " << free_bytes / (1024.0 * 1024.0 * 1024.0)
+           << " GB are free; coarsen further (max_levels, min_coarse_rows) or use another coarse_solver";
+        FatalError(ss.str().c_str(), AMGX_ERR_NO_MEMORY);
+    }
+
     amgx::memory::cudaMallocAsync((void **)&ptr, sz);
     cudaCheckError();
 

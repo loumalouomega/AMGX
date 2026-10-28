@@ -40,6 +40,7 @@ SA_AMG_Level_Base<T_Config>::SA_AMG_Level_Base(AMG_Class *amg, ThreadManager *tm
     const std::string &scope = amg->m_cfg_scope;
     m_eps_strong = cfg.AMG_Config::template getParameter<double>("aggregation_eps_strong", scope);
     m_eps_decay = cfg.AMG_Config::template getParameter<double>("aggregation_eps_decay", scope);
+    m_mis_index_priority = cfg.AMG_Config::template getParameter<std::string>("aggregation_mis_priority", scope) == "INDEX";
     m_relax = cfg.AMG_Config::template getParameter<double>("sa_relaxation_factor", scope);
     m_power_iters = cfg.AMG_Config::template getParameter<int>("sa_spectral_radius_iters", scope);
     m_drop_tol = cfg.AMG_Config::template getParameter<double>("sa_prolongator_drop_tol", scope);
@@ -271,7 +272,7 @@ void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
     if (b == 1)
     {
         SymmetricScaledStrength<TConfig>::computeStrongConnections(As, this->m_level_eps, this->m_strong, this->m_filtered_diag);
-        MIS2Aggregates<TConfig>::compute(As, this->m_strong, this->m_aggregates, this->m_num_aggregates, this->m_num_removed);
+        MIS2Aggregates<TConfig>::compute(As, this->m_strong, this->m_aggregates, this->m_num_aggregates, this->m_num_removed, this->m_mis_index_priority);
     }
     else
     {
@@ -281,7 +282,7 @@ void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
         typename Base::MVector point_diag;
         PointwiseAggregation<TConfig>::buildPointMatrix(As, b, Ap);
         SymmetricScaledStrength<TConfig>::computeStrongConnections(Ap, this->m_level_eps, strong_points, point_diag);
-        MIS2Aggregates<TConfig>::compute(Ap, strong_points, this->m_aggregates, this->m_num_aggregates, this->m_num_removed);
+        MIS2Aggregates<TConfig>::compute(Ap, strong_points, this->m_aggregates, this->m_num_aggregates, this->m_num_removed, this->m_mis_index_priority);
         PointwiseAggregation<TConfig>::expandStrongConnections(As, b, Ap, strong_points, this->m_strong, this->m_filtered_diag);
     }
 

@@ -29,13 +29,9 @@ LGMRES_Solver<T_Config>::LGMRES_Solver(AMG_Config &cfg, const std::string &cfg_s
         m_preconditioner = SolverFactory<T_Config>::allocate(cfg, cfg_scope, "preconditioner");
     }
 
-    m_M = cfg.AMG_Config::template getParameter<int>("gmres_n_restart", cfg_scope);
+    // Total basis size: gmres_n_restart Krylov columns plus K augmentation columns (AMGCL's M + K)
     m_K = cfg.AMG_Config::template getParameter<int>("lgmres_augmentation_k", cfg_scope);
-
-    if (m_K >= m_M)
-    {
-        FatalError("LGMRES needs lgmres_augmentation_k < gmres_n_restart", AMGX_ERR_CONFIGURATION);
-    }
+    m_M = cfg.AMG_Config::template getParameter<int>("gmres_n_restart", cfg_scope) + m_K;
 
     if (this->m_norm_type != L2)
     {
@@ -57,7 +53,7 @@ LGMRES_Solver<T_Config>::~LGMRES_Solver()
 template<class T_Config>
 void LGMRES_Solver<T_Config>::printSolverParameters() const
 {
-    std::cout << "gmres_n_restart=" << m_M << ", lgmres_augmentation_k=" << m_K << std::endl;
+    std::cout << "gmres_n_restart=" << m_M - m_K << ", lgmres_augmentation_k=" << m_K << std::endl;
 
     if (m_preconditioner != NULL)
     {

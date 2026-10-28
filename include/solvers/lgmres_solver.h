@@ -18,9 +18,10 @@ namespace amgx
 {
 
 /***************************************************
- * LGMRES(M, K), right preconditioned: restarted GMRES whose M basis columns end with
- * the (normalized) corrections dx of the last K restart cycles. M is gmres_n_restart,
- * K is lgmres_augmentation_k; K = 0 is GMRES(M). One iteration is one Arnoldi step.
+ * LGMRES(M, K), right preconditioned: restarted GMRES whose M + K basis columns end with
+ * the (normalized) corrections dx of the last K restart cycles, as AMGCL. M is
+ * gmres_n_restart (Krylov steps per cycle), K is lgmres_augmentation_k; K = 0 is GMRES(M).
+ * m_M holds the total basis size M + K. One iteration is one Arnoldi step.
  * Real and complex modes, L2 norm only.
  **************************************************/
 template<class T_Config>

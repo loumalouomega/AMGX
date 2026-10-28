@@ -122,6 +122,7 @@ class SA_AMG_Level_Base : public AMG_Level<T_Config>
 
         double m_eps_strong;
         double m_eps_decay;
+        bool m_mis_index_priority;          // aggregation_mis_priority=INDEX
         double m_relax;
         int m_power_iters;
         double m_drop_tol;

@@ -221,6 +221,75 @@ Solver<TConfig> *smoother(const std::string &params, Matrix_d &A)
 DECLARE_UNITTEST_END(SmootherP1Tests_Base);
 
 // ------------------------------------------------------------------------------------------------
+// P1.3: the persistent ParILU state refactors an unchanged pattern with new values exactly as a fresh
+// factorization, and repeated factorizations (ILUP and ILUT) are bitwise identical
+DECLARE_UNITTEST_BEGIN_EXTD(ParILURefactor, SmootherP1Tests_Base<T_Config>);
+
+bool identical(const Matrix_h &X, const Matrix_h &Y)
+{
+    if (X.get_num_nz() != Y.get_num_nz() || X.get_num_rows() != Y.get_num_rows()) { return false; }
+
+    for (int i = 0; i <= X.get_num_rows(); i++)
+        if (X.row_offsets[i] != Y.row_offsets[i]) { return false; }
+
+    for (int k = 0; k < X.get_num_nz(); k++)
+        if (X.col_indices[k] != Y.col_indices[k] || X.values[k] != Y.values[k]) { return false; }
+
+    return true;
+}
+
+void run()
+{
+    const Rows R = randomNonsymmetric5pt(20, 18, 11);
+    Rows R2 = R;
+
+    for (size_t i = 0; i < R2.size(); i++)
+        for (std::map<int, double>::iterator it = R2[i].begin(); it != R2[i].end(); ++it) { it->second *= (it->first == (int) i ? 1.7 : 0.8); }
+
+    Matrix_h A_h, A2_h;
+    this->load(A_h, R);
+    this->load(A2_h, R2);
+    Matrix_d A = A_h, A2 = A2_h;
+
+    for (int level = 0; level < 2; level++)
+    {
+        // refactor on new values == fresh factorization of the new matrix
+        ParILUFactor<TConfig> kept, fresh;
+        Matrix_d L, U, L2, U2;
+        kept.factorPower(A, level, 12, L, U);
+        UNITTEST_ASSERT_TRUE(kept.samePattern(A2));
+        kept.refactorPower(A2, 12, L, U);
+        fresh.factorPower(A2, level, 12, L2, U2);
+        Matrix_h Lh = L, Uh = U, L2h = L2, U2h = U2;
+        UNITTEST_ASSERT_TRUE(identical(Lh, L2h));
+        UNITTEST_ASSERT_TRUE(identical(Uh, U2h));
+    }
+
+    // determinism of the threshold factorization
+    Matrix_d L1, U1, L2, U2;
+    ParILU<TConfig>::factorThreshold(A, 1e-3, 3.0, 6, L1, U1);
+    ParILU<TConfig>::factorThreshold(A, 1e-3, 3.0, 6, L2, U2);
+    Matrix_h L1h = L1, U1h = U1, L2h = L2, U2h = U2;
+    UNITTEST_ASSERT_TRUE(identical(L1h, L2h));
+    UNITTEST_ASSERT_TRUE(identical(U1h, U2h));
+    // a different pattern is detected
+    Rows R3 = R;
+    R3[0][R3.size() - 1] = 0.5;
+    Matrix_h A3_h;
+    this->load(A3_h, R3);
+    Matrix_d A3 = A3_h;
+    ParILUFactor<TConfig> f;
+    Matrix_d L, U;
+    f.factorPower(A, 0, 4, L, U);
+    UNITTEST_ASSERT_TRUE(!f.samePattern(A3));
+}
+
+DECLARE_UNITTEST_END(ParILURefactor)
+
+ParILURefactor<TemplateMode<AMGX_mode_dDDI>::Type> ParILURefactor_dDDI;
+ParILURefactor<TemplateMode<AMGX_mode_dFFI>::Type> ParILURefactor_dFFI;
+
+// ------------------------------------------------------------------------------------------------
 // P1.1: SPAI0 matches m_i = a_ii / sum_j a_ij^2 (scalar) and M_i = A_ii / sum_j ||A_ij||_F^2 (blocks)
 DECLARE_UNITTEST_BEGIN_EXTD(SPAI0Setup, SmootherP1Tests_Base<T_Config>);
 

@@ -397,7 +397,7 @@ inline void registerParameters()
     //[F]GMRES
     AMG_Config::registerParameter<int>("gmres_n_restart", "the number of Krylov vectors used in FGMRES or GMRES solver ", 20);
     AMG_Config::registerParameter<int>("bicgstab_l", "BICGSTABL: degree L of the minimal residual polynomial of BiCGStab(L)", 2, 1, 8);
-    AMG_Config::registerParameter<int>("lgmres_augmentation_k", "LGMRES: number of previous corrections that augment each restart cycle (gmres_n_restart is the total basis size)", 3, 0, 20);
+    AMG_Config::registerParameter<int>("lgmres_augmentation_k", "LGMRES: number of previous corrections that augment each restart cycle (the basis has gmres_n_restart Krylov plus lgmres_augmentation_k augmentation columns, as AMGCL's M + K)", 3, 0, 20);
     //Composite preconditioners
     AMG_Config::registerParameter<std::string>("cpr_pressure_solver", "CPR: solver of the pressure system (as AMGCL pprecond)", "AMG", solver_values);
     AMG_Config::registerParameter<std::string>("cpr_global_smoother", "CPR: global smoother applied to the full system before the pressure correction (as AMGCL sprecond)", "MULTICOLOR_DILU", solver_values);
@@ -430,7 +430,7 @@ inline void registerParameters()
     AMG_Config::registerParameter<double>("ilut_drop_tol", "ILUT: drop factor entries not above ilut_drop_tol * sum_j |a_ij| / (off-diagonal entries of row i), as AMGCL tau", 1e-2, 0.0, 1.0);
     AMG_Config::registerParameter<double>("ilut_fill_factor", "ILUT: keep at most ilut_fill_factor * nnz(lower/upper part of a_i) entries per factor row", 2.0, 0.0, 1e6);
     AMG_Config::registerParameter<int>("ilup_fill_level", "ILUP: incomplete LU on the pattern of A^(ilup_fill_level+1), 0 is ILU(0)", 1, 0, 10);
-    AMG_Config::registerParameter<int>("ilu_factor_sweeps", "ILUT/ILUP: number of parallel fixed-point sweeps of the factorization", 5, 1, 1000);
+    AMG_Config::registerParameter<int>("ilu_factor_sweeps", "ILUT/ILUP: number of parallel fixed-point sweeps of the factorization, -1 for the variant default (ILUP 30, ILUT 10)", -1, -1, 1000);
     std::vector<std::string> ilu_solve_values;
     ilu_solve_values.push_back("JACOBI");
     ilu_solve_values.push_back("CUSPARSE");
@@ -477,6 +477,10 @@ inline void registerParameters()
     reordering_values.push_back("NONE");
     reordering_values.push_back("RCM");
     AMG_Config::registerParameter<std::string>("reordering", "bandwidth-reducing reordering of the system before the setup (top-level solver scope, single GPU), solved and returned in the original numbering <NONE|RCM>", "NONE", reordering_values);
+    std::vector<std::string> mis_priority_values;
+    mis_priority_values.push_back("HASH");
+    mis_priority_values.push_back("INDEX");
+    AMG_Config::registerParameter<std::string>("aggregation_mis_priority", "SMOOTHED_AGGREGATION: priority of the parallel MIS(2) seeds, hashed or by index (lexicographically first MIS(2), the seeds of AMGCL's greedy plain_aggregates) <HASH|INDEX>", "HASH", mis_priority_values);
     AMG_Config::registerParameter<int>("numeric_rebuild", "with structure_reuse_levels != 0, keep the sorted A P and R A P patterns of SMOOTHED_AGGREGATION and CLASSICAL levels and recompute only their values on reuse levels <0|1>", 1, 0, 1);
     AMG_Config::registerParameter<int>("structure_reuse_levels", "controls reuse of AMG hierarchy, 0 - everything rebuilds, 1 - reuse coloring on the finest level, 2 - reuse coloring on the next level, etc.", 0);
     std::vector<int> error_scaling_values;

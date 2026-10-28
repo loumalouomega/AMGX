@@ -58,6 +58,12 @@ class PBiCGStab_Solver : public Solver<T_Config>
         // Run a single iteration. Compute the residual and its norm and decide convergence.
         AMGX_STATUS solve_iteration( VVector &b, VVector &x, bool xIsZero );
 
+        // Restart the recurrences from the residual in m_r: r_tilde = p = r, rho = <r_tilde, r>
+        void restart();
+        // A convergence claim of the recursive residual is checked against b - A x (residual
+        // replacement); if the true residual has not converged the recurrences restart from it
+        AMGX_STATUS confirmConvergence( VVector &b, VVector &x, AMGX_STATUS claimed );
+
         // Finalize the solver after running the iterations.
         void solve_finalize( VVector &b, VVector &x );
 };

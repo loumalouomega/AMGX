@@ -78,6 +78,13 @@ BiCGStab_Solver<T_Config>::solve_init(  VVector &b, VVector &x, bool xIsZero )
         FatalError("Make sure the residual has previously been computed.", AMGX_ERR_UNKNOWN);
     }
 
+    restart();
+}
+
+template<class T_Config>
+void
+BiCGStab_Solver<T_Config>::restart()
+{
     // r_tilde = r. TODO: use a random vector as r_star.
     amgx::thrust::copy(this->m_r->begin(), this->m_r->end(), m_r_tilde.begin()); //these guys should have the same size (OWNED)
     cudaCheckError();
@@ -87,6 +94,27 @@ BiCGStab_Solver<T_Config>::solve_init(  VVector &b, VVector &x, bool xIsZero )
     amgx::thrust::copy(this->m_r->begin(), this->m_r->end(), m_p.begin());
     cudaCheckError();
     m_p.dirtybit = 1;
+}
+
+template<class T_Config>
+AMGX_STATUS
+BiCGStab_Solver<T_Config>::confirmConvergence( VVector &b, VVector &x, AMGX_STATUS claimed )
+{
+    if ( claimed != AMGX_ST_CONVERGED )
+    {
+        return claimed;
+    }
+
+    this->compute_residual( b, x );
+    this->compute_norm();
+    const AMGX_STATUS status = this->converged();
+
+    if ( !isDone( status ) )
+    {
+        restart();
+    }
+
+    return status;
 }
 
 //launches a single standard cycle
@@ -116,8 +144,8 @@ BiCGStab_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZero
     {
         axpby( x, m_p, x, ValueTypeB(1), alpha, offset, size );
         x.dirtybit = 1;
-        this->compute_residual( b, x );
-        this->compute_norm();
+        conv_stat = confirmConvergence( b, x, conv_stat );
+        A.setView(oldView);
         return conv_stat;
     }
 
@@ -146,16 +174,19 @@ BiCGStab_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZero
     axpby( m_s, m_t, *this->m_r, ValueTypeB(1), -omega, offset, size );
     this->m_r->dirtybit = 1;
 
-    // Do we converge ?
+    // Do we converge ? (on r = s - omega t)
     if ( this->m_monitor_convergence &&
-         isDone( (conv_stat = this->compute_norm_and_converged( m_s, m_s_norm )) ) )
+         isDone( (conv_stat = this->compute_norm_and_converged()) ) )
     {
+        conv_stat = confirmConvergence( b, x, conv_stat );
+        A.setView(oldView);
         return conv_stat;
     }
 
     // Early exit: last iteration, no need to prepare the next one.
     if ( this->is_last_iter() )
     {
+        A.setView(oldView);
         return this->m_monitor_convergence ? AMGX_ST_NOT_CONVERGED : AMGX_ST_CONVERGED;
     }
 
