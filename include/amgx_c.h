@@ -295,6 +295,23 @@ AMGX_RC AMGX_API AMGX_matrix_get_nnz
 (const AMGX_matrix_handle mtx,
  int *nnz);
 
+/* Near-nullspace vectors for SMOOTHED_AGGREGATION (e.g. rigid body modes).
+   vectors[k] holds n*block_dimy values; num_vectors == 0 clears the nullspace.
+   Call after the matrix has been uploaded. */
+AMGX_RC AMGX_API AMGX_matrix_set_nullspace
+(AMGX_matrix_handle mtx,
+ int num_vectors,
+ const double *const *vectors);
+
+/* Orthonormal rigid body modes of a 2D (3 modes) or 3D (6 modes) elasticity problem with
+   ndim interleaved displacement dofs per node. coords holds num_nodes*ndim coordinates,
+   mode k is written to modes[k * num_nodes * ndim, (k + 1) * num_nodes * ndim). */
+AMGX_RC AMGX_API AMGX_generate_rigid_body_modes
+(int ndim,
+ int num_nodes,
+ const double *coords,
+ double *modes);
+
 AMGX_RC AMGX_API AMGX_matrix_download_all
 (const AMGX_matrix_handle mtx,
  int *row_ptrs,

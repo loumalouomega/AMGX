@@ -541,6 +541,7 @@ inline void registerParameters()
     AMG_Config::registerParameter<double>("aggregation_eps_strong", "SMOOTHED_AGGREGATION: threshold eps for the symmetric strength criterion a_ij^2 > eps^2 a_ii a_jj", 0.08, 0.0, 1.0);
     AMG_Config::registerParameter<double>("aggregation_eps_decay", "SMOOTHED_AGGREGATION: per-level multiplier of aggregation_eps_strong (floored at 1e-4)", 0.5, 1e-10, 1.0);
     AMG_Config::registerParameter<double>("sa_relaxation_factor", "SMOOTHED_AGGREGATION: prolongator smoothing damping is omega = sa_relaxation_factor * 4 / (3 rho(D^-1 A^F))", 0.67, 1e-10, 2.0);
+    AMG_Config::registerParameter<int>("aggregation_block_size", "SMOOTHED_AGGREGATION: number of interleaved unknowns per node of a scalar fine matrix, aggregated pointwise (BSR matrices use their block size)", 1, 1, 64);
     AMG_Config::registerParameter<int>("sa_spectral_radius_iters", "SMOOTHED_AGGREGATION: power iterations used to estimate rho(D^-1 A^F), 0 uses the Gershgorin bound", 4, 0, 1000);
     AMG_Config::registerParameter<double>("sa_prolongator_drop_tol", "SMOOTHED_AGGREGATION: drop prolongator entries below sa_prolongator_drop_tol * max |p_ik| of the row (rows are rescaled to keep their sum), 0 disables truncation", 0.02, 0.0, 1.0);
     AMG_Config::registerParameter<int>("obtain_timings", "flag that cause the solvers to print total setup and solve times <0|1>", 0);

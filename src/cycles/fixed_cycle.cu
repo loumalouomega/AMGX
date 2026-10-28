@@ -31,10 +31,10 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
     Solver<T_Config> *smoother = level->getSmoother();
     VVector &bc = level->getbc();
     bc.set_block_dimx(1);
-    bc.set_block_dimy(A.get_block_dimy());
+    bc.set_block_dimy(level->getCoarseBlockDim());
     VVector &xc = level->getxc();
     xc.set_block_dimx(1);
-    xc.set_block_dimy(A.get_block_dimx());
+    xc.set_block_dimy(level->getCoarseBlockDim());
     VVector &r = level->getr();
     int levelnum = A.template getParameter <int>("level");
     int *smoothing_direction = nullptr;

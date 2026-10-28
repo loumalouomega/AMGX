@@ -16,6 +16,8 @@
 #include <aggregation/strength/symmetric_scaled.h>
 #include <aggregation/selectors/mis2_aggregates.h>
 #include <aggregation/sa_prolongation.h>
+#include <aggregation/pointwise.h>
+#include <aggregation/rigid_body_modes.h>
 #include <thrust/functional.h>
 
 #include <cmath>
@@ -25,6 +27,158 @@
 
 namespace amgx
 {
+
+namespace
+{
+
+// 3D linear elasticity on nx x ny x nz unit-size trilinear hexahedra, 3 x 3 blocks per node pair.
+// Nodes on the x = 0 face get identity rows when clamp is set.
+struct ElasticityBSR
+{
+    int n;
+    std::vector<int> ro, ci;
+    std::vector<double> v, coords;
+    std::vector<char> clamped;
+};
+
+void hex8Stiffness(double h, double nu, double Ke[24][24])
+{
+    const double lam = nu / ((1 + nu) * (1 - 2 * nu)), mu = 1.0 / (2 * (1 + nu));
+    double D[6][6] = {{0}};
+
+    for (int i = 0; i < 3; i++)
+    {
+        for (int j = 0; j < 3; j++) { D[i][j] = lam; }
+
+        D[i][i] = lam + 2 * mu;
+        D[i + 3][i + 3] = mu;
+    }
+
+    for (int i = 0; i < 24; i++)
+        for (int j = 0; j < 24; j++) { Ke[i][j] = 0; }
+
+    const double g = 1.0 / std::sqrt(3.0);
+
+    for (int q = 0; q < 8; q++)
+    {
+        const double xi = (q & 1 ? g : -g), eta = (q & 2 ? g : -g), zeta = (q & 4 ? g : -g);
+        double B[6][24] = {{0}};
+
+        for (int a = 0; a < 8; a++)
+        {
+            const double sa = (a & 1) ? 1 : -1, ta = (a & 2) ? 1 : -1, ua = (a & 4) ? 1 : -1;
+            const double dx = 0.25 * sa * (1 + ta * eta) * (1 + ua * zeta) / h;
+            const double dy = 0.25 * ta * (1 + sa * xi) * (1 + ua * zeta) / h;
+            const double dz = 0.25 * ua * (1 + sa * xi) * (1 + ta * eta) / h;
+            B[0][3 * a] = dx; B[1][3 * a + 1] = dy; B[2][3 * a + 2] = dz;
+            B[3][3 * a] = dy; B[3][3 * a + 1] = dx;
+            B[4][3 * a + 1] = dz; B[4][3 * a + 2] = dy;
+            B[5][3 * a] = dz; B[5][3 * a + 2] = dx;
+        }
+
+        const double w = h * h * h / 8;
+
+        for (int i = 0; i < 24; i++)
+            for (int j = 0; j < 24; j++)
+            {
+                double s = 0;
+
+                for (int k = 0; k < 6; k++)
+                    for (int l = 0; l < 6; l++) { s += B[k][i] * D[k][l] * B[l][j]; }
+
+                Ke[i][j] += w * s;
+            }
+    }
+}
+
+ElasticityBSR elasticity3d(int nx, int ny, int nz, bool clamp)
+{
+    static double Ke[24][24];
+    hex8Stiffness(1.0, 0.3, Ke);
+    const int px = nx + 1, py = ny + 1, pz = nz + 1, nn = px * py * pz;
+    std::vector<double> slots((size_t) nn * 27 * 9, 0.0);
+
+    for (int k = 0; k < nz; k++)
+        for (int j = 0; j < ny; j++)
+            for (int i = 0; i < nx; i++)
+                for (int a = 0; a < 8; a++)
+                    for (int c = 0; c < 8; c++)
+                    {
+                        const int na = (i + (a & 1)) + px * ((j + ((a >> 1) & 1)) + py * (k + ((a >> 2) & 1)));
+                        const int off = ((c & 1) - (a & 1) + 1) * 9 + (((c >> 1) & 1) - ((a >> 1) & 1) + 1) * 3 + (((c >> 2) & 1) - ((a >> 2) & 1) + 1);
+
+                        for (int r = 0; r < 3; r++)
+                            for (int s = 0; s < 3; s++) { slots[((size_t) na * 27 + off) * 9 + r * 3 + s] += Ke[3 * a + r][3 * c + s]; }
+                    }
+
+    ElasticityBSR A;
+    A.n = nn;
+    A.ro.push_back(0);
+
+    for (int k = 0; k < pz; k++)
+        for (int j = 0; j < py; j++)
+            for (int i = 0; i < px; i++)
+            {
+                A.coords.push_back(i);
+                A.coords.push_back(j);
+                A.coords.push_back(k);
+                A.clamped.push_back(clamp && i == 0);
+            }
+
+    for (int k = 0; k < pz; k++)
+        for (int j = 0; j < py; j++)
+            for (int i = 0; i < px; i++)
+            {
+                const int n = i + px * (j + py * k);
+
+                for (int dz = -1; dz <= 1; dz++)
+                    for (int dy = -1; dy <= 1; dy++)
+                        for (int dx = -1; dx <= 1; dx++)
+                        {
+                            const int ii = i + dx, jj = j + dy, kk = k + dz;
+
+                            if (ii < 0 || jj < 0 || kk < 0 || ii >= px || jj >= py || kk >= pz) { continue; }
+
+                            const int m = ii + px * (jj + py * kk);
+
+                            if ((A.clamped[n] || A.clamped[m]) && m != n) { continue; }
+
+                            A.ci.push_back(m);
+
+                            for (int q = 0; q < 9; q++)
+                            {
+                                A.v.push_back(A.clamped[n] ? (q % 4 == 0 ? 1.0 : 0.0) : slots[((size_t) n * 27 + (dx + 1) * 9 + (dy + 1) * 3 + (dz + 1)) * 9 + q]);
+                            }
+                        }
+
+                A.ro.push_back((int) A.ci.size());
+            }
+
+    return A;
+}
+
+// Scalar CSR with interleaved unknowns
+void elasticityToScalar(const ElasticityBSR &A, std::vector<int> &ro, std::vector<int> &ci, std::vector<double> &v)
+{
+    ro.assign(1, 0);
+    ci.clear();
+    v.clear();
+
+    for (int I = 0; I < A.n; I++)
+        for (int r = 0; r < 3; r++)
+        {
+            for (int k = A.ro[I]; k < A.ro[I + 1]; k++)
+                for (int c = 0; c < 3; c++)
+                {
+                    ci.push_back(A.ci[k] * 3 + c);
+                    v.push_back(A.v[(size_t) k * 9 + r * 3 + c]);
+                }
+
+            ro.push_back((int) ci.size());
+        }
+}
+
+} // anonymous namespace
 
 DECLARE_UNITTEST_BEGIN(SmoothedAggregationTests_Base);
 
@@ -220,6 +374,49 @@ int deviceAggregates(const Matrix_d &A_d, double eps, BVector_d &strong, MVector
     Aggregates_d::compute(A_d, strong, agg, num_aggregates, num_removed);
     agg_h = agg;
     return num_aggregates;
+}
+
+// 3 x 3 block matrix; with diag_prop the diagonal blocks are stored separately (DIAG property)
+void loadBSR(Matrix_h &A, const ElasticityBSR &E, bool diag_prop)
+{
+    std::vector<int> ro(1, 0), ci;
+    std::vector<double> v, d((size_t) E.n * 9, 0.0);
+
+    for (int I = 0; I < E.n; I++)
+    {
+        for (int k = E.ro[I]; k < E.ro[I + 1]; k++)
+        {
+            if (diag_prop && E.ci[k] == I)
+            {
+                std::copy(E.v.begin() + (size_t) k * 9, E.v.begin() + (size_t)(k + 1) * 9, d.begin() + (size_t) I * 9);
+                continue;
+            }
+
+            ci.push_back(E.ci[k]);
+            v.insert(v.end(), E.v.begin() + (size_t) k * 9, E.v.begin() + (size_t)(k + 1) * 9);
+        }
+
+        ro.push_back((int) ci.size());
+    }
+
+    A.set_initialized(0);
+    A.addProps(CSR);
+
+    if (diag_prop) { A.addProps(DIAG); }
+
+    A.resize(E.n, E.n, (int) ci.size(), 3, 3, 1);
+
+    for (int i = 0; i <= E.n; i++) { A.row_offsets[i] = ro[i]; }
+
+    for (size_t k = 0; k < ci.size(); k++) { A.col_indices[k] = ci[k]; }
+
+    for (size_t k = 0; k < v.size(); k++) { A.values[k] = ValueTypeA(v[k]); }
+
+    if (diag_prop)
+        for (size_t k = 0; k < d.size(); k++) { A.values[ci.size() * 9 + k] = ValueTypeA(d[k]); }
+
+    A.computeDiagonal();
+    A.set_initialized(1);
 }
 
 DECLARE_UNITTEST_END(SmoothedAggregationTests_Base);
@@ -613,5 +810,329 @@ void run()
 DECLARE_UNITTEST_END(SAEndToEnd)
 
 SAEndToEnd<TemplateMode<AMGX_mode_dDDI>::Type> SAEndToEnd_dDDI;
+
+// ------------------------------------------------------------------------------------------------
+// P0.5: rigid body modes are orthonormal and in the kernel of a free-floating stiffness matrix
+DECLARE_UNITTEST_BEGIN_EXTD(SARigidBodyModes, SmoothedAggregationTests_Base<T_Config>);
+
+void run()
+{
+    const ElasticityBSR E = elasticity3d(5, 4, 3, false);
+    const size_t n = (size_t) E.n * 3;
+    std::vector<double> modes(6 * n);
+    UNITTEST_ASSERT_EQUAL(AMGX_generate_rigid_body_modes(3, E.n, &E.coords[0], &modes[0]), AMGX_RC_OK);
+    double orthogonality = 0.0, energy = 0.0;
+
+    for (int k = 0; k < 6; k++)
+    {
+        const double *u = &modes[k * n];
+
+        for (int l = 0; l < 6; l++)
+        {
+            double dot = 0.0;
+
+            for (size_t i = 0; i < n; i++) { dot += u[i] * modes[l * n + i]; }
+
+            orthogonality = std::max(orthogonality, std::fabs(dot - (k == l ? 1.0 : 0.0)));
+        }
+
+        double uKu = 0.0;
+
+        for (int I = 0; I < E.n; I++)
+            for (int r = 0; r < 3; r++)
+            {
+                double Ku = 0.0;
+
+                for (int q = E.ro[I]; q < E.ro[I + 1]; q++)
+                    for (int c = 0; c < 3; c++) { Ku += E.v[(size_t) q * 9 + r * 3 + c] * u[E.ci[q] * 3 + c]; }
+
+                uKu += u[I * 3 + r] * Ku;
+            }
+
+        energy = std::max(energy, std::fabs(uKu));
+    }
+
+    UNITTEST_ASSERT_TRUE(orthogonality < 1e-12);
+    UNITTEST_ASSERT_TRUE(energy < 1e-10);
+    // 2D: 3 modes; unsupported dimensions are rejected
+    std::vector<double> c2(8), m2(3 * 8);
+
+    for (int i = 0; i < 4; i++) { c2[2 * i] = i % 2; c2[2 * i + 1] = i / 2; }
+
+    UNITTEST_ASSERT_EQUAL(AMGX_generate_rigid_body_modes(2, 4, &c2[0], &m2[0]), AMGX_RC_OK);
+    UNITTEST_ASSERT_TRUE(AMGX_generate_rigid_body_modes(4, 4, &c2[0], &m2[0]) != AMGX_RC_OK);
+}
+
+DECLARE_UNITTEST_END(SARigidBodyModes)
+
+SARigidBodyModes<TemplateMode<AMGX_mode_dDDI>::Type> SARigidBodyModes_dDDI;
+
+// ------------------------------------------------------------------------------------------------
+// P0.3 / P0.11: BSR to scalar expansion, point matrix and expanded strong connections
+DECLARE_UNITTEST_BEGIN_EXTD(SAPointwiseAggregation, SmoothedAggregationTests_Base<T_Config>);
+
+typedef aggregation::PointwiseAggregation<TConfig_d> Pointwise_d;
+
+void run()
+{
+    const ElasticityBSR E = elasticity3d(6, 4, 3, true);
+    std::vector<int> ro, ci;
+    std::vector<double> v;
+    elasticityToScalar(E, ro, ci, v);
+    Matrix_h S_h;
+    this->loadCSR(S_h, E.n * 3, E.n * 3, ro, ci, v);
+    typename SAPointwiseAggregation<T_Config>::SparseRows ref = this->toRows(S_h);
+
+    // Expansion of BSR, with the diagonal inside and stored separately
+    for (int diag_prop = 0; diag_prop < 2; diag_prop++)
+    {
+        Matrix_h B_h;
+        this->loadBSR(B_h, E, diag_prop != 0);
+        Matrix_d B_d = B_h, S_d;
+        Pointwise_d::blockToScalar(B_d, S_d);
+        Matrix_h Sx_h = S_d;
+        UNITTEST_ASSERT_EQUAL(Sx_h.get_num_rows(), E.n * 3);
+        UNITTEST_ASSERT_TRUE(this->maxDiff(this->toRows(Sx_h), ref) == 0.0);
+    }
+
+    // Point matrix: max |a_ij| over each 3 x 3 block
+    Matrix_d S_d = S_h, Ap_d;
+    Pointwise_d::buildPointMatrix(S_d, 3, Ap_d);
+    Matrix_h Ap_h = Ap_d;
+    typename SAPointwiseAggregation<T_Config>::SparseRows ap_ref(E.n);
+
+    for (int i = 0; i < S_h.get_num_rows(); i++)
+        for (int k = S_h.row_offsets[i]; k < S_h.row_offsets[i + 1]; k++)
+        {
+            double &m = ap_ref[i / 3][S_h.col_indices[k] / 3];
+            m = std::max(m, std::fabs((double) S_h.values[k]));
+        }
+
+    UNITTEST_ASSERT_TRUE(this->maxDiff(this->toRows(Ap_h), ap_ref) == 0.0);
+    // Unknowns of a node are coupled as strongly as their nodes
+    typename SAPointwiseAggregation<T_Config>::BVector_d strong_points, strong;
+    typename SAPointwiseAggregation<T_Config>::MVector_d point_diag, d_f;
+    SAPointwiseAggregation<T_Config>::Strength_d::computeStrongConnections(Ap_d, 0.08, strong_points, point_diag);
+    Pointwise_d::expandStrongConnections(S_d, 3, Ap_d, strong_points, strong, d_f);
+    typename SAPointwiseAggregation<T_Config>::BVector_h sp_h = strong_points, s_h = strong;
+    std::map<std::pair<int, int>, bool> sp_map;
+
+    for (int I = 0; I < Ap_h.get_num_rows(); I++)
+        for (int k = Ap_h.row_offsets[I]; k < Ap_h.row_offsets[I + 1]; k++) { sp_map[std::make_pair(I, (int) Ap_h.col_indices[k])] = sp_h[k]; }
+
+    int mismatches = 0;
+
+    for (int i = 0; i < S_h.get_num_rows(); i++)
+        for (int k = S_h.row_offsets[i]; k < S_h.row_offsets[i + 1]; k++)
+        {
+            const int j = S_h.col_indices[k];
+            const bool expected = (i != j) && (i / 3 == j / 3 || sp_map[std::make_pair(i / 3, j / 3)]);
+
+            if (bool(s_h[k]) != expected) { mismatches++; }
+        }
+
+    UNITTEST_ASSERT_EQUAL(mismatches, 0);
+}
+
+DECLARE_UNITTEST_END(SAPointwiseAggregation)
+
+SAPointwiseAggregation<TemplateMode<AMGX_mode_dDDI>::Type> SAPointwiseAggregation_dDDI;
+SAPointwiseAggregation<TemplateMode<AMGX_mode_dFFI>::Type> SAPointwiseAggregation_dFFI;
+
+// ------------------------------------------------------------------------------------------------
+// P0.4 / P0.8: nullspace tentative prolongator (QR per aggregate) and nullspace-preserving truncation
+DECLARE_UNITTEST_BEGIN_EXTD(SANullspaceProlongator, SmoothedAggregationTests_Base<T_Config>);
+
+typedef aggregation::PointwiseAggregation<TConfig_d> Pointwise_d;
+typedef typename aggregation::SAProlongation<TConfig_d>::DVector DVector_d;
+typedef Vector<typename TConfig_h::template setVecPrec<AMGX_vecDouble>::Type> DVector_h;
+
+// max_i |(P Bc)_i - target_i| over the rows of P
+double nullspaceError(const Matrix_h &P, const DVector_h &Bc, int K, const std::vector<double> &target)
+{
+    double err = 0.0;
+
+    for (int i = 0; i < P.get_num_rows(); i++)
+        for (int c = 0; c < K; c++)
+        {
+            double s = 0.0;
+
+            for (int k = P.row_offsets[i]; k < P.row_offsets[i + 1]; k++) { s += (double) P.values[k] * Bc[(size_t) P.col_indices[k] * K + c]; }
+
+            err = std::max(err, std::fabs(s - target[(size_t) i * K + c]));
+        }
+
+    return err;
+}
+
+void run()
+{
+    const int K = 6;
+    const ElasticityBSR E = elasticity3d(8, 4, 4, true);
+    const int n = E.n * 3;
+    std::vector<int> ro, ci;
+    std::vector<double> v, modes((size_t) K * n), B((size_t) n * K);
+    elasticityToScalar(E, ro, ci, v);
+    aggregation::rigidBodyModes(3, E.n, &E.coords[0], &modes[0]);
+
+    for (int i = 0; i < n; i++)
+        for (int c = 0; c < K; c++) { B[(size_t) i * K + c] = modes[(size_t) c * n + i]; }
+
+    Matrix_h A_h;
+    this->loadCSR(A_h, n, n, ro, ci, v);
+    Matrix_d A_d = A_h, Ap, S, P_tent, P;
+    typename SANullspaceProlongator<T_Config>::BVector_d strong_points, strong;
+    typename SANullspaceProlongator<T_Config>::MVector_d point_diag, d_f;
+    typename SANullspaceProlongator<T_Config>::IVector_d agg;
+    int naggr = 0, removed = 0;
+    Pointwise_d::buildPointMatrix(A_d, 3, Ap);
+    SANullspaceProlongator<T_Config>::Strength_d::computeStrongConnections(Ap, 0.08, strong_points, point_diag);
+    SANullspaceProlongator<T_Config>::Aggregates_d::compute(Ap, strong_points, agg, naggr, removed);
+    removed += Pointwise_d::removeSmallAggregates(agg, naggr, 3, K);
+    Pointwise_d::expandStrongConnections(A_d, 3, Ap, strong_points, strong, d_f);
+    UNITTEST_ASSERT_TRUE(naggr > 1);
+    DVector_d B_d((size_t) n * K), Bc_d;
+    amgx::thrust::copy(B.begin(), B.end(), B_d.begin());
+    SANullspaceProlongator<T_Config>::Prolongation_d::buildTentativeProlongatorNullspace(agg, naggr, 3, K, B_d, P_tent, Bc_d);
+    Matrix_h Pt_h = P_tent;
+    DVector_h Bc_h = Bc_d;
+    IVector_h agg_h = agg;
+    UNITTEST_ASSERT_EQUAL(Pt_h.get_num_cols(), naggr * K);
+    // P_tent^T P_tent = I: the columns of each aggregate are orthonormal and aggregates are disjoint
+    std::vector<double> PtP((size_t) naggr * K * K, 0.0);
+    std::vector<double> target((size_t) n * K, 0.0);
+    const double tol = sizeof(ValueTypeA) == 4 ? 1e-5 : 1e-14;
+
+    for (int i = 0; i < n; i++)
+    {
+        const int len = Pt_h.row_offsets[i + 1] - Pt_h.row_offsets[i];
+        UNITTEST_ASSERT_EQUAL(len, agg_h[i / 3] >= 0 ? K : 0);
+
+        for (int k = Pt_h.row_offsets[i]; k < Pt_h.row_offsets[i + 1]; k++)
+            for (int l = Pt_h.row_offsets[i]; l < Pt_h.row_offsets[i + 1]; l++)
+            {
+                const int a = Pt_h.col_indices[k] / K;
+                UNITTEST_ASSERT_EQUAL(a, Pt_h.col_indices[l] / K);
+                PtP[((size_t) a * K + Pt_h.col_indices[k] % K) * K + Pt_h.col_indices[l] % K] += (double) Pt_h.values[k] * Pt_h.values[l];
+            }
+
+        if (agg_h[i / 3] >= 0)
+            for (int c = 0; c < K; c++) { target[(size_t) i * K + c] = B[(size_t) i * K + c]; }
+    }
+
+    double orth = 0.0;
+
+    for (int a = 0; a < naggr; a++)
+        for (int r = 0; r < K; r++)
+            for (int c = 0; c < K; c++) { orth = std::max(orth, std::fabs(PtP[((size_t) a * K + r) * K + c] - (r == c ? 1.0 : 0.0))); }
+
+    UNITTEST_ASSERT_TRUE(orth < tol);
+    // P_tent Bc reproduces B on the aggregated unknowns
+    UNITTEST_ASSERT_TRUE(this->nullspaceError(Pt_h, Bc_h, K, target) < (sizeof(ValueTypeA) == 4 ? 1e-4 : 1e-12));
+    // Smoothed P, then truncation keeps P Bc unchanged row by row
+    SANullspaceProlongator<T_Config>::Strength_d::buildFilteredScaledOperator(A_d, strong, d_f, S);
+    const double rho = SANullspaceProlongator<T_Config>::Prolongation_d::estimateSpectralRadius(S, 0);
+    AMG_Config cfg;
+    void *wk = CSR_Multiply<TConfig_d>::csr_workspace_create(cfg, "default");
+    SANullspaceProlongator<T_Config>::Prolongation_d::smoothProlongator(S, 0.67 * 4.0 / (3.0 * rho), P_tent, P, wk);
+    CSR_Multiply<TConfig_d>::csr_workspace_delete(wk);
+    Matrix_h P_h = P;
+    std::vector<double> PBc((size_t) n * K, 0.0);
+
+    for (int i = 0; i < n; i++)
+        for (int k = P_h.row_offsets[i]; k < P_h.row_offsets[i + 1]; k++)
+            for (int c = 0; c < K; c++) { PBc[(size_t) i * K + c] += (double) P_h.values[k] * Bc_h[(size_t) P_h.col_indices[k] * K + c]; }
+
+    SANullspaceProlongator<T_Config>::Prolongation_d::truncateNullspace(P, 0.1, K, Bc_d);
+    Matrix_h Ptr_h = P;
+    UNITTEST_ASSERT_TRUE(Ptr_h.get_num_nz() < P_h.get_num_nz());
+    UNITTEST_ASSERT_TRUE(this->nullspaceError(Ptr_h, Bc_h, K, PBc) < (sizeof(ValueTypeA) == 4 ? 1e-3 : 1e-10));
+}
+
+DECLARE_UNITTEST_END(SANullspaceProlongator)
+
+SANullspaceProlongator<TemplateMode<AMGX_mode_dDDI>::Type> SANullspaceProlongator_dDDI;
+SANullspaceProlongator<TemplateMode<AMGX_mode_dFFI>::Type> SANullspaceProlongator_dFFI;
+
+// ------------------------------------------------------------------------------------------------
+// Stage 2 milestone: clamped 3D elasticity with rigid body modes through the C API, as BSR and as
+// a scalar matrix with aggregation_block_size = 3
+DECLARE_UNITTEST_BEGIN_EXTD(SAElasticity, SmoothedAggregationTests_Base<T_Config>);
+
+int solve(const ElasticityBSR &E, bool block, bool nullspace)
+{
+    const int n = E.n * 3;
+    std::vector<int> ro, ci;
+    std::vector<double> v, modes((size_t) 6 * n), b_vec(n, 1.0), x_vec(n, 0.0);
+
+    if (block) { ro = E.ro; ci = E.ci; v = E.v; }
+    else { elasticityToScalar(E, ro, ci, v); }
+
+    for (int I = 0; I < E.n; I++)
+        if (E.clamped[I])
+            for (int r = 0; r < 3; r++) { b_vec[I * 3 + r] = 0.0; }
+
+    std::stringstream params;
+    params << "config_version=2, determinism_flag=1, solver(main)=PCG, main:max_iters=200, main:tolerance=1e-8,"
+           << " main:convergence=RELATIVE_INI_CORE, main:norm=L2, main:monitor_residual=1, main:preconditioner(amg)=AMG,"
+           << " amg:algorithm=SMOOTHED_AGGREGATION, amg:max_iters=1, amg:cycle=V, amg:smoother(gs)=MULTICOLOR_GS,"
+           << " gs:symmetric_GS=1, amg:presweeps=1, amg:postsweeps=1, amg:coarse_solver=DENSE_LU_SOLVER,"
+           << " amg:dense_lu_num_rows=64, amg:aggregation_block_size=" << (block ? 1 : 3);
+    AMGX_config_handle cfg;
+    AMGX_resources_handle rsrc;
+    AMGX_matrix_handle A;
+    AMGX_vector_handle b, x;
+    AMGX_solver_handle solver;
+    UNITTEST_ASSERT_EQUAL(AMGX_config_create(&cfg, params.str().c_str()), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_resources_create_simple(&rsrc, cfg), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_matrix_create(&A, rsrc, AMGX_mode_dDDI), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_vector_create(&b, rsrc, AMGX_mode_dDDI), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_vector_create(&x, rsrc, AMGX_mode_dDDI), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_solver_create(&solver, rsrc, AMGX_mode_dDDI, cfg), AMGX_OK);
+    const int bs = block ? 3 : 1;
+    UNITTEST_ASSERT_EQUAL(AMGX_matrix_upload_all(A, n / bs, (int) ci.size(), bs, bs, &ro[0], &ci[0], &v[0], NULL), AMGX_OK);
+
+    if (nullspace)
+    {
+        UNITTEST_ASSERT_EQUAL(AMGX_generate_rigid_body_modes(3, E.n, &E.coords[0], &modes[0]), AMGX_RC_OK);
+        const double *ptrs[6];
+
+        for (int k = 0; k < 6; k++) { ptrs[k] = &modes[(size_t) k * n]; }
+
+        UNITTEST_ASSERT_EQUAL(AMGX_matrix_set_nullspace(A, 6, ptrs), AMGX_RC_OK);
+    }
+
+    UNITTEST_ASSERT_EQUAL(AMGX_vector_upload(b, n / bs, bs, &b_vec[0]), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_vector_upload(x, n / bs, bs, &x_vec[0]), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_solver_setup(solver, A), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_solver_solve_with_0_initial_guess(solver, b, x), AMGX_OK);
+    AMGX_SOLVE_STATUS status;
+    int iters = 0;
+    UNITTEST_ASSERT_EQUAL(AMGX_solver_get_status(solver, &status), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_solver_get_iterations_number(solver, &iters), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(status, AMGX_SOLVE_SUCCESS);
+    UNITTEST_ASSERT_EQUAL(AMGX_solver_destroy(solver), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_vector_destroy(x), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_vector_destroy(b), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_matrix_destroy(A), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_resources_destroy(rsrc), AMGX_OK);
+    UNITTEST_ASSERT_EQUAL(AMGX_config_destroy(cfg), AMGX_OK);
+    return iters;
+}
+
+void run()
+{
+    const ElasticityBSR E = elasticity3d(24, 6, 6, true);
+    const int scalar_rbm = solve(E, false, true);
+    const int block_rbm = solve(E, true, true);
+    const int block_plain = solve(E, true, false);
+    UNITTEST_ASSERT_TRUE(scalar_rbm < 30);
+    UNITTEST_ASSERT_TRUE(block_rbm < 40);
+    UNITTEST_ASSERT_TRUE(block_rbm < block_plain);
+}
+
+DECLARE_UNITTEST_END(SAElasticity)
+
+SAElasticity<TemplateMode<AMGX_mode_dDDI>::Type> SAElasticity_dDDI;
 
 } // namespace amgx

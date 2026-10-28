@@ -38,6 +38,7 @@
 #include "amgx_c_wrappers.inl"
 #include "amgx_c_common.h"
 #include "multiply.h"
+#include "aggregation/rigid_body_modes.h"
 
 namespace amgx
 {
@@ -3890,6 +3891,64 @@ extern "C" {
         nvtxRange nvrf(__func__);
 
         return AMGX_matrix_get_nnz_impl(mtx, nnz);
+    }
+
+    AMGX_RC AMGX_API AMGX_matrix_set_nullspace(AMGX_matrix_handle mtx, int num_vectors, const double *const *vectors)
+    {
+        nvtxRange nvrf(__func__);
+
+        Resources *resources = NULL;
+        AMGX_CHECK_API_ERROR_NORSRC(getAMGXerror(getResourcesFromMatrixHandle(mtx, &resources)))
+        AMGX_ERROR rc = AMGX_OK;
+
+        AMGX_TRIES()
+        {
+            if (num_vectors < 0 || (num_vectors > 0 && vectors == NULL))
+            {
+                FatalError("AMGX_matrix_set_nullspace: invalid nullspace vectors", AMGX_ERR_BAD_PARAMETERS);
+            }
+
+            AMGX_Mode mode = get_mode_from(mtx);
+
+            switch (mode)
+            {
+#define AMGX_CASE_LINE(CASE) case CASE: { \
+        Matrix<typename TemplateMode<CASE>::Type> *mtx_ptr = get_mode_object_from<CASE,Matrix,AMGX_matrix_handle>(mtx); \
+        const size_t n = (size_t) mtx_ptr->get_num_rows() * mtx_ptr->get_block_dimy(); \
+        mtx_ptr->m_nullspace.assign(n * num_vectors, 0.0); \
+        mtx_ptr->m_nullspace_cols = num_vectors; \
+        for (int k = 0; k < num_vectors; k++) \
+            for (size_t i = 0; i < n; i++) { mtx_ptr->m_nullspace[i * num_vectors + k] = vectors[k][i]; } \
+    } \
+    break;
+                    AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+                    AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+                default:
+                    AMGX_CHECK_API_ERROR(AMGX_ERR_BAD_MODE, resources)
+            }
+        }
+
+        AMGX_CATCHES(rc)
+        AMGX_CHECK_API_ERROR(rc, resources)
+        return AMGX_RC_OK;
+    }
+
+    AMGX_RC AMGX_API AMGX_generate_rigid_body_modes(int ndim, int num_nodes, const double *coords, double *modes)
+    {
+        nvtxRange nvrf(__func__);
+
+        AMGX_ERROR rc = AMGX_OK;
+
+        AMGX_TRIES()
+        {
+            aggregation::rigidBodyModes(ndim, num_nodes, coords, modes);
+        }
+
+        AMGX_CATCHES(rc)
+        AMGX_CHECK_API_ERROR_NORSRC(rc)
+        return AMGX_RC_OK;
     }
 
     AMGX_RC AMGX_matrix_download_all_impl(const AMGX_matrix_handle mtx, int *row_ptrs, int *col_indices, void *data, void **diag_data)

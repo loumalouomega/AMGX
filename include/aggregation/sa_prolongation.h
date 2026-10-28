@@ -43,6 +43,29 @@ struct SAProlongation
     // Overwrites S with J = I - omega S and computes P = J P_tent.
     static void smoothProlongator(Matrix<TConfig> &S, double omega, const Matrix<TConfig> &P_tent,
                                   Matrix<TConfig> &P, void *csr_workspace);
+
+    typedef Vector<typename TConfig::template setVecPrec<AMGX_vecDouble>::Type> DVector;
+
+    // Block prolongator without nullspace: unknown k of a node in aggregate a is interpolated
+    // from coarse unknown a * block_size + k (aggregates are given per node).
+    static void buildTentativeProlongatorBlock(const IVector &aggregates, int num_aggregates, int block_size,
+            Matrix<TConfig> &P_tent);
+
+    // Nullspace prolongator: for each aggregate the rows of B (row-major, n x K, n = nodes * block_size)
+    // are factorized as B_a = Q_a R_a; P_tent holds Q_a and the coarse nullspace Bc (row-major,
+    // num_aggregates * K x K) holds R_a.
+    static void buildTentativeProlongatorNullspace(const IVector &aggregates, int num_aggregates, int block_size,
+            int K, const DVector &B, Matrix<TConfig> &P_tent, DVector &Bc);
+
+    // Coarse nullspace of buildTentativeProlongatorBlock: row a * block_size + k is e_k.
+    static void blockIdentityNullspace(int num_aggregates, int block_size, DVector &Bc);
+
+    // Largest K supported by truncateNullspace
+    static const int MAX_TRUNCATION_K = 8;
+
+    // Drops |p_ij| < drop_tol * max_k |p_ik| and corrects the kept entries of each row with the
+    // minimum-norm change that preserves (P Bc)_i. Rows where that is impossible are kept whole.
+    static void truncateNullspace(Matrix<TConfig> &P, double drop_tol, int K, const DVector &Bc);
 };
 
 } // namespace aggregation

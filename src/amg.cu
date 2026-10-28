@@ -368,11 +368,11 @@ class AMG_Setup
                     // Resize coarse vectors.
                     int nextSize = level->getNextLevelSize();
                     level->getxc( ).resize( nextSize );
-                    level->getxc().set_block_dimy(level->getA( ).get_block_dimy());
+                    level->getxc().set_block_dimy(level->getCoarseBlockDim());
                     level->getxc().set_block_dimx(1);
                     level->getxc().tag = nextLevel->tag * 100 + 1;
                     level->getbc( ).resize( nextSize );
-                    level->getbc().set_block_dimy(level->getA( ).get_block_dimy());
+                    level->getbc().set_block_dimy(level->getCoarseBlockDim());
                     level->getbc().set_block_dimx(1);
                     level->getbc().tag = nextLevel->tag * 100 + 0;
                     int size, offset;
@@ -735,11 +735,11 @@ class AMG_Setup
                     // Resize coarse vectors.
                     int nextSize = level->getNextLevelSize();
                     level->getxc( ).resize( nextSize );
-                    level->getxc().set_block_dimy(level->getA( ).get_block_dimy());
+                    level->getxc().set_block_dimy(level->getCoarseBlockDim());
                     level->getxc().set_block_dimx(1);
                     level->getxc().tag = nextLevel->tag * 100 + 1;
                     level->getbc( ).resize( nextSize );
-                    level->getbc().set_block_dimy(level->getA( ).get_block_dimy());
+                    level->getbc().set_block_dimy(level->getCoarseBlockDim());
                     level->getbc().set_block_dimx(1);
                     level->getbc().tag = nextLevel->tag * 100 + 0;
                     int size, offset;

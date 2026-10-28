@@ -113,6 +113,10 @@ class AMG_Level
             return m_next_level_size;
         }
 
+        // Block dimension of the coarse grid vectors (xc, bc). Aggregation and classical AMG keep
+        // the fine block size, smoothed aggregation always produces scalar coarse matrices.
+        virtual int getCoarseBlockDim() { return A->get_block_dimy(); }
+
         template<class CycleDispatcher >
         void generateNextCycles( AMG_Class *amg, VVector &b, VVector &x, const CycleDispatcher &dispatcher = CycleDispatcher( ) )
         {

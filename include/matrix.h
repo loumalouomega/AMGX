@@ -825,6 +825,11 @@ class MatrixBase : public AuxData, public Operator<T_Config>
 
         /* DIAG */
         IVector diag;        //size: num_rows*block_size
+
+        /* Near-nullspace vectors used by smoothed aggregation, row-major
+           (num_rows*block_dimy) x m_nullspace_cols, set with AMGX_matrix_set_nullspace */
+        std::vector<double> m_nullspace;
+        int m_nullspace_cols = 0;
 #ifdef DEBUG
         IVector diag_copy;        //size: num_rows*block_size
 #endif
