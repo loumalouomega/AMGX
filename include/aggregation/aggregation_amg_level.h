@@ -71,6 +71,7 @@ class Aggregation_AMG_Level_Base : public AMG_Level<T_Config>
             m_error_scaling = amg->m_cfg->AMG_Config::template getParameter<int>("error_scaling", amg->m_cfg_scope );
             reuse_scale = amg->m_cfg->AMG_Config::template getParameter<int>("reuse_scale", amg->m_cfg_scope );
             scaling_smoother_steps = amg->m_cfg->AMG_Config::template getParameter<int>("scaling_smoother_steps", amg->m_cfg_scope );
+            m_over_interp = amg->m_cfg->AMG_Config::template getParameter<double>("aggregation_over_interp", amg->m_cfg_scope );
             scale_counter = 0;
         }
 
@@ -125,6 +126,7 @@ class Aggregation_AMG_Level_Base : public AMG_Level<T_Config>
         int m_error_scaling;
         int reuse_scale;
         int scaling_smoother_steps;
+        double m_over_interp;
 
         int scale_counter;
         ValueTypeB scale;

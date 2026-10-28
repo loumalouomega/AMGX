@@ -97,6 +97,10 @@ inline AlgorithmType getValue<AlgorithmType>(const char *name)
     {
         return ENERGYMIN;
     }
+    else if (strncmp(name, "SMOOTHED_AGGREGATION", 100) == 0)
+    {
+        return SMOOTHED_AGGREGATION;
+    }
 
     char error[100];
     sprintf(error, "AlgorithmType'%s' is not defined", name);

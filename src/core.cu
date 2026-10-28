@@ -78,6 +78,7 @@
 #include <classical/strength/affinity.h>
 
 #include <aggregation/aggregation_amg_level.h>
+#include <aggregation/sa_amg_level.h>
 #include <aggregation/selectors/dummy.h>
 #include <aggregation/selectors/size2_selector.h>
 #include <aggregation/selectors/size4_selector.h>
@@ -419,7 +420,8 @@ inline void registerParameters()
     algorithm_values.push_back(CLASSICAL);
     algorithm_values.push_back(AGGREGATION);
     algorithm_values.push_back(ENERGYMIN);
-    AMG_Config::registerParameter<AlgorithmType>("algorithm", "the AMG algorithm <CLASSICAL,AGGREGATION,ENERGYMIN>", CLASSICAL, algorithm_values);
+    algorithm_values.push_back(SMOOTHED_AGGREGATION);
+    AMG_Config::registerParameter<AlgorithmType>("algorithm", "the AMG algorithm <CLASSICAL,AGGREGATION,ENERGYMIN,SMOOTHED_AGGREGATION>", CLASSICAL, algorithm_values);
     AMG_Config::registerParameter<int>("amg_host_levels_rows", "levels with number of rows below this number will be solved on host. -1 to disable", -1);
     //Register Cycle Parameters
     AMG_Config::registerParameter<std::string>("cycle", "the cycle algorithm <V|W|F|CG|CGF>", "V", getAllCycles());
@@ -534,6 +536,13 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("print_grid_stats", "flag that allows to print information about the amg hierarchy <0|1>", 0);
     AMG_Config::registerParameter<int>("print_vis_data", "flag that allows to print information about the solver convergence <0|1>", 0);
     AMG_Config::registerParameter<int>("print_aggregation_info", "flag that allows to print additional information about aggregation AMG hierarchy<0|1>", 0);
+    AMG_Config::registerParameter<double>("aggregation_over_interp", "AGGREGATION: coarse operator is scaled as Ac = (1/alpha) R A P to compensate for over-correction of plain aggregation, alpha >= 1", 1.0, 1.0, 1e10);
+    //Register Smoothed Aggregation Parameters
+    AMG_Config::registerParameter<double>("aggregation_eps_strong", "SMOOTHED_AGGREGATION: threshold eps for the symmetric strength criterion a_ij^2 > eps^2 a_ii a_jj", 0.08, 0.0, 1.0);
+    AMG_Config::registerParameter<double>("aggregation_eps_decay", "SMOOTHED_AGGREGATION: per-level multiplier of aggregation_eps_strong (floored at 1e-4)", 0.5, 1e-10, 1.0);
+    AMG_Config::registerParameter<double>("sa_relaxation_factor", "SMOOTHED_AGGREGATION: prolongator smoothing damping is omega = sa_relaxation_factor * 4 / (3 rho(D^-1 A^F))", 0.67, 1e-10, 2.0);
+    AMG_Config::registerParameter<int>("sa_spectral_radius_iters", "SMOOTHED_AGGREGATION: power iterations used to estimate rho(D^-1 A^F), 0 uses the Gershgorin bound", 4, 0, 1000);
+    AMG_Config::registerParameter<double>("sa_prolongator_drop_tol", "SMOOTHED_AGGREGATION: drop prolongator entries below sa_prolongator_drop_tol * max |p_ik| of the row (rows are rescaled to keep their sum), 0 disables truncation", 0.02, 0.0, 1.0);
     AMG_Config::registerParameter<int>("obtain_timings", "flag that cause the solvers to print total setup and solve times <0|1>", 0);
     AMG_Config::registerParameter<int>("store_res_history", "flag that allows to store the residual history of a solver solver <0|1>", 0);
     AMG_Config::registerParameter<int>("convergence_analysis", "number of levels that will be analysed. 0=no analysis, 1=only finest, 2=finest and second finest etc. <0>", 0);
@@ -627,6 +636,7 @@ struct registerClasses<T_Config, false>
         AMG_LevelFactory<T_Config>::registerFactory(CLASSICAL, new Classical_AMG_LevelFactory<T_Config>);
         AMG_LevelFactory<T_Config>::registerFactory(AGGREGATION, new Aggregation_AMG_LevelFactory<T_Config>);
         AMG_LevelFactory<T_Config>::registerFactory(ENERGYMIN, new Energymin_AMG_LevelFactory<T_Config>);
+        AMG_LevelFactory<T_Config>::registerFactory(SMOOTHED_AGGREGATION, new SA_AMG_LevelFactory<T_Config>);
         //Register Cycles
         CycleFactory<T_Config>::registerFactory("V", new V_CycleFactory<T_Config>);
         CycleFactory<T_Config>::registerFactory("F", new F_CycleFactory<T_Config>);

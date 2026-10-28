@@ -44,6 +44,14 @@ namespace aggregation
 {
 
 
+template <typename ValueType>
+struct scale_by
+{
+    double alpha;
+    scale_by(double alpha) : alpha(alpha) {}
+    __host__ __device__ ValueType operator()(const ValueType &v) const { return v * alpha; }
+};
+
 // ----------------------
 // Kernels
 // ----------------------
@@ -1997,6 +2005,15 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
     Ac.set_initialized(0);
     Ac.copyAuxData(&A);
     this->m_coarseAGenerator->computeAOperator(A, Ac, this->m_aggregates, this->m_R_row_offsets, this->m_R_column_indices, this->m_num_all_aggregates);
+
+    // Over-interpolation: Ac = (1/alpha) R A P
+    if (this->m_over_interp != 1.0)
+    {
+        thrust_wrapper::transform<TConfig::memSpace>(Ac.values.begin(), Ac.values.end(), Ac.values.begin(),
+                scale_by<ValueTypeA>(1.0 / this->m_over_interp));
+        cudaCheckError();
+    }
+
     Ac.setColsReorderedByColor(false);
     Ac.setView(FULL);
 

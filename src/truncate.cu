@@ -500,6 +500,8 @@ int scan_warp(volatile IndexType *ptr, const unsigned int idx)
     return ptr[idx];
 }
 
+// Copies the entries of each row with |a_ij| >= truncate_factor * metric[i] and rescales them so
+// that the row keeps its original sum (one thread per row).
 template <typename IndexType, typename matValueType, typename vecValueType, int THREADS_PER_BLOCK,
           int THREADS_PER_VECTOR>
 __global__
@@ -510,91 +512,22 @@ void truncateAndScale_kernel(const IndexType *A_offsets, const IndexType *A_indi
                              const vecValueType *old_row_sums, const vecValueType *new_row_sums,
                              const double truncate_factor, const vecValueType *metric)
 {
-    const int WARP_SIZE = 32;
-    const int WARPS_PER_BLOCK = THREADS_PER_BLOCK / WARP_SIZE;
-    const int VECTORS_PER_WARP = WARP_SIZE / THREADS_PER_VECTOR;
-    // allocate shared memory for warp-based scans (assume up to 512 threads / block)
-    __shared__ volatile int s_scan[WARP_SIZE * WARPS_PER_BLOCK];
-    __shared__ volatile int s_A_ptr[WARPS_PER_BLOCK * VECTORS_PER_WARP][2]; // row offsets for A
-    __shared__ volatile int s_At_ptr[WARPS_PER_BLOCK * VECTORS_PER_WARP][2]; // row offsets for At
-    __shared__ double s_scale[WARPS_PER_BLOCK * VECTORS_PER_WARP]; // scaling factor for each warp
-    const int vectors_per_block = THREADS_PER_BLOCK / WARP_SIZE * VECTORS_PER_WARP;
-    const int num_vectors = THREADS_PER_BLOCK / THREADS_PER_VECTOR * gridDim.x;
-    const int vector_id = (threadIdx.x + blockIdx.x * blockDim.x) / THREADS_PER_VECTOR;
-    const int thread_lane = threadIdx.x & (THREADS_PER_VECTOR - 1);
-    const int vector_lane = threadIdx.x / THREADS_PER_VECTOR;
-    int scan_offset = 0;
-    matValueType val = 0., fval = 0.;
-    IndexType ind = 0;
-
-    // outer loop over rows
-    for (int row = vector_id; row < num_rows; row += num_vectors)
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < num_rows; row += gridDim.x * blockDim.x)
     {
-        scan_offset = 0;
-        val = 0.;
-        fval = 0.; // fabs(val)
+        const double threshold = truncate_factor * metric[row];
+        const double scale = (new_row_sums[row] != vecValueType(0)) ? (double) old_row_sums[row] / (double) new_row_sums[row] : 1.0;
+        IndexType At_index = At_offsets[row];
 
-        if (threadIdx.x < vectors_per_block && threadIdx.x < num_rows - row) // first threads in first warp
+        for (IndexType k = A_offsets[row]; k < A_offsets[row + 1]; k++)
         {
-            s_scale[threadIdx.x] = old_row_sums[row + threadIdx.x] / new_row_sums[row + threadIdx.x];
-        }
+            const matValueType val = A_values[k];
 
-        __syncthreads();
-
-        if (thread_lane < 2)
-        {
-            s_A_ptr[vector_lane][thread_lane] = A_offsets[row + thread_lane];
-            s_At_ptr[vector_lane][thread_lane] = At_offsets[row + thread_lane];
-        }
-
-        const int row_start = s_A_ptr[vector_lane][0];
-        const int row_end   = s_A_ptr[vector_lane][1];
-        const int row_len = row_end - row_start;
-        const int At_row_start = s_At_ptr[vector_lane][0];
-        // mark & scan over consecutive blocks of 32 threads
-        int nloops = (int)ceilf((float)row_len / THREADS_PER_VECTOR);
-#pragma unroll 2
-
-        for (int i = 0; i < nloops; i++)
-        {
-            // initialise shared memory to 0
-            s_scan[threadIdx.x] = 0;
-
-            // mark appropriate elements of the row
-            if (i * THREADS_PER_VECTOR + thread_lane < row_len)
+            if (fabs(val) >= threshold)
             {
-                val = A_values[row_start + i * THREADS_PER_VECTOR + thread_lane];
-                ind = A_indices[row_start + i * THREADS_PER_VECTOR + thread_lane];
-                fval = fabs(val);
-                s_scan[threadIdx.x] = fval >= truncate_factor * metric[row] ? 1 : 0;
+                At_values[At_index] = val * scale;
+                At_indices[At_index] = A_indices[k];
+                At_index++;
             }
-
-            // now prefix scan over this
-            scan_warp(&s_scan[vector_lane * THREADS_PER_VECTOR], thread_lane); // threadIdx.x%32);
-
-            // copy relevant parts of A to At
-            if (i * THREADS_PER_VECTOR + thread_lane < row_len)
-            {
-                if (fval >= truncate_factor * metric[row])
-                {
-                    // get relevant index in At
-                    const int At_index = At_row_start + scan_offset + s_scan[threadIdx.x] - 1;
-
-                    if (s_scale[vector_lane] == 0.)
-                    {
-                        At_values[At_index] = val;
-                    }
-                    else
-                    {
-                        At_values[At_index] = val / s_scale[vector_lane];
-                    }
-
-                    At_indices[At_index] = ind;
-                }
-            }
-
-            // note new scan_offset
-            scan_offset = s_scan[vector_lane * THREADS_PER_VECTOR + THREADS_PER_VECTOR - 1];
         }
     }
 }
@@ -603,10 +536,10 @@ template <typename Matrix, typename Vector, int THREADS_PER_BLOCK, int THREADS_P
 void truncateAndScale(const Matrix &A, Matrix &A_trunc, const Vector &row_sum, const Vector &new_row_sum,
                       const double trunc_factor, const Vector &metric)
 {
-    const int num_blocks = std::min(4096, A.get_num_rows());
+    const int num_blocks = std::max(1, std::min(4096, (A.get_num_rows() + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK));
     truncateAndScale_kernel<typename Matrix::index_type, typename Matrix::value_type,
                             typename Vector::value_type, THREADS_PER_BLOCK, THREADS_PER_VECTOR>
-                            <<< num_blocks, 128>>>(A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(),
+                            <<< num_blocks, THREADS_PER_BLOCK>>>(A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(),
                                     A.get_num_rows(),
                                     A_trunc.row_offsets.raw(), A_trunc.col_indices.raw(),
                                     A_trunc.values.raw(),

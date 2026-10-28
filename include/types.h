@@ -54,7 +54,7 @@ inline const char *getString(BlockFormat p)
 
 // AlgorithmType
 
-enum AlgorithmType { CLASSICAL, AGGREGATION, ENERGYMIN };
+enum AlgorithmType { CLASSICAL, AGGREGATION, ENERGYMIN, SMOOTHED_AGGREGATION };
 
 inline const char *getString(AlgorithmType p)
 {
@@ -68,6 +68,9 @@ inline const char *getString(AlgorithmType p)
 
         case ENERGYMIN:
             return "ENERGYMIN";
+
+        case SMOOTHED_AGGREGATION:
+            return "SMOOTHED_AGGREGATION";
 
         default:
             return "UNKNOWN";

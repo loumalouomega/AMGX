@@ -1,0 +1,31 @@
+{
+    "config_version": 2, 
+    "determinism_flag": 1, 
+    "solver": {
+        "print_grid_stats": 1, 
+        "algorithm": "SMOOTHED_AGGREGATION", 
+        "obtain_timings": 1, 
+        "solver": "AMG", 
+        "smoother": "BLOCK_JACOBI", 
+        "relaxation_factor": 0.8, 
+        "presweeps": 1, 
+        "postsweeps": 1, 
+        "aggregation_eps_strong": 0.08, 
+        "aggregation_eps_decay": 0.5, 
+        "sa_relaxation_factor": 0.67, 
+        "sa_spectral_radius_iters": 4, 
+        "sa_prolongator_drop_tol": 0.02, 
+        "coarse_solver": "DENSE_LU_SOLVER", 
+        "dense_lu_num_rows": 64, 
+        "min_coarse_rows": 32, 
+        "print_solve_stats": 1, 
+        "convergence": "RELATIVE_INI", 
+        "max_iters": 100, 
+        "monitor_residual": 1, 
+        "scope": "main", 
+        "max_levels": 50, 
+        "tolerance" : 1e-08, 
+        "norm": "L2", 
+        "cycle": "V"
+    }
+}
