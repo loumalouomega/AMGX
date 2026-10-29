@@ -98,9 +98,9 @@ The goal of this section is to bring the remaining AMGCL components into AMGX's 
   - Per-row shared-memory steps (one CTA per row: candidate gather, bitonic de-duplication, fused values and selection) instead of the global key sort and rank selection. 0.264 s at 20 sweeps against 0.233 s for the global path, after strided ownership and float |v| keys in shared memory. Occupancy is bounded by the per-row shared memory, and most rows are short.
   - Fewer pattern-selection steps than sweeps (`ilut_pattern_steps`, values-only sweeps in between): 3 steps → 33 iterations (0.040 s), 5 → 21 (0.047 s), 8 → 14 (0.062 s). That is no better than plain sweeps at equal setup time.
   - The probe needs about 20 selection steps on this matrix; at 4–20 ms per step the 0.07 s target is out of reach for ParILUT here.
-- **Specification:**
-  - An asynchronous Gauss-Seidel-style sweep variant behind `determinism_flag=0`, which needs fewer steps.
-  - A better starting pattern (e.g. ILUP(1) values) to cut the number of selection steps.
+  - Asynchronous (in-place, Chow–Patel) sweeps: identical iterations at every step count and no faster, since a step is dominated by candidate generation and selection, not by its sweep. Not kept.
+- **Kept: `ilut_initial_fill_level`** (decision 16). ParILUT starts from the pattern of $A^{k+1}$ instead of A, so fewer selection steps reach the deep fill. k = 1 reaches 9 iterations in 15 steps (0.168 s, against 20 steps and 0.25 s from A), and is level with k = 0 at the cheaper end. k = 2 is slower. The target is still missed.
+- **Specification:** what is left is a cheaper step. The candidate generation and selection need a kernel design that beats the global radix sort on short rows (the per-row shared-memory attempt did not).
 - **Probe:** ILUT on the 65k-row anisotropic convection-diffusion probe reaches AMGCL's GMRES(50) iteration count (9) with setup at most AMGCL's serial time (0.07 s) on RTX 2000 Ada.
 
 ---
@@ -123,7 +123,7 @@ All P3 items are closed; design choices and AMGCL-baseline measurements are in d
 
 - **Effort:** **L**
 - **Gap:** The graph-partitioned consolidation of `AGGREGATION` levels is implemented and verified on one GPU with up to 8 ranks (decision 15): `matrix_consolidation_partitioner=SCOTCH` groups neighbouring ranks with PT-Scotch when the rows per rank fall below `matrix_consolidation_lower_threshold` (reference config `src/configs/PCG_AGGREGATION_CONSOLIDATION.json`, threshold 2000). What is missing is the scaling evidence, which needs a cluster.
-  - Not in scope: the CLASSICAL glue path and SA levels (consolidation stops SA with an error).
+  - Not in scope: the CLASSICAL glue path and SA levels (consolidation stops SA with an error). SA consolidation through the classical coarse-level glue was attempted and stopped (decision 16): that path (`COARSE_CLA_CONSO`, compiled out) no longer compiles, and once fixed aborts in `MPI_Gatherv` on its first coarse glue for CLASSICAL itself. It needs repair before SA can use it.
 - **Probe:** Weak scaling test up to 256 GPUs on an unstructured tetrahedral mesh. Prove setup and solve time scalability efficiency $\ge 75\%$ from 8 to 256 GPUs on level 4 and deeper.
 
 #### P4.2 Distributed Smoothed Aggregation
@@ -134,6 +134,9 @@ All P3 items are closed; design choices and AMGCL-baseline measurements are in d
     - 7-point Poisson 64³: 20 / 20 / 19 / 20.
     - Clamped elasticity, 46,875 DOFs, 6 rigid-body modes: 33 / 30 / 32 / 33.
   - The ±2% criterion is met at 4 ranks. At 2 and 3 ranks elasticity takes 1–3 *fewer* iterations, since the aggregates depend on the partition.
+  - BSR input (3×3 blocks) gives the same counts, 33 / 30 / 32 / 33, with `dense_lu_num_rows` scaled by the block size (decision 16).
+  - Numeric-only resetup on structure-reuse levels: 0.232 → 0.062 s per resetup on 4 ranks, same iterations, Ac equal to a full rebuild within $7 \times 10^{-16}$ (decision 16).
+  - `ci/mpi_checks.sh` covers all of this (20 checks, about a minute).
   - Not done: the 16-GPU run, and overlapping the halo exchanges of the Galerkin product with computation (the classical path's exchanges are synchronous).
 - **Probe:** Multi-GPU 3D Elasticity with 6 rigid-body modes across 16 GPUs (4 nodes $\times$ 4 H100s). Check that iteration counts are identical ($\pm 2\%$) to single-GPU execution with identical physical parameters.
 
@@ -182,7 +185,7 @@ Stage 4: Distributed Scaling, Cache Optimization, and Production Hardening
   Milestone: Weak scaling across 64+ GPUs maintains ≥ 75% parallel efficiency on unstructured meshes.
   P5 measured (decision 13): RCM 2.6-2.8x faster CG / AMG-PCG iterations on a randomly numbered 16.9M-cell
     serpentine (no change on lexicographic numbering); coefficient-only resetup 49% (SA) / 37% (classical) faster.
-  P4 measured on one GPU with up to 8 MPI ranks (decision 15): distributed SA within one iteration of single GPU
+  P4 measured on one GPU with up to 8 MPI ranks (decisions 15, 16; regression script ci/mpi_checks.sh): distributed SA within one iteration of single GPU
     (Poisson, elasticity); multi-rank consolidation fixed and graph-partitioned. Scaling probes need a cluster.
 ```
 
@@ -205,6 +208,7 @@ To maintain ergonomic parity with AMGCL while integrating cleanly into AMGX, all
 | **ILUT**        | `p`             | `ilut_fill_factor`         | `float` | `2`     | Keep at most $p \cdot$ nnz of the lower/upper part of $a_i$ per factor row |
 | **ILUP**        | `k`             | `ilup_fill_level`          | `int`   | `1`     | ILU on the pattern of $A^{k+1}$ (0 = ILU(0))    |
 | **ILU**         | N/A             | `ilu_factor_sweeps`        | `int`   | `-1`    | ParILU/ParILUT fixed-point sweeps; -1 = variant default (ILUP 30, ILUT 10) |
+| **ILUT**        | N/A             | `ilut_initial_fill_level`  | `int`   | `0`     | ParILUT starts from the pattern of $A^{k+1}$ (0: A); fewer steps reach the deep fill |
 | **ILU**         | `solve.iters`   | `ilu_solve_iters`          | `int`   | `2`     | Jacobi iterations per triangular solve          |
 | **ILU**         | `solve.damping` | `ilu_solve_damping`        | `float` | `0.72`  | Damping of the Jacobi triangular solves         |
 | **ILU**         | N/A             | `ilu_solve_method`         | `enum`  | `JACOBI`| `JACOBI` (approximate, graph-safe) or `CUSPARSE` (exact SpSV) |
@@ -226,7 +230,7 @@ To maintain ergonomic parity with AMGCL while integrating cleanly into AMGX, all
 | **Deflation**   | `vec`, `nvec`   | `AMGX_matrix_set_deflation_vectors` | API | — | Deflation vectors $Z$ (column per vector) |
 | **Deflation**   | N/A             | `deflation_use_nullspace`  | `int`   | `0`     | Deflate the near-nullspace of `AMGX_matrix_set_nullspace` instead |
 | **Reorder**     | `adapter::reorder` | `reordering`            | `enum`  | `NONE`  | `RCM`: reverse Cuthill-McKee of the system before setup (top-level scope, single GPU) |
-| **Rebuild**     | `allow_rebuild` | `numeric_rebuild`          | `int`   | `1`     | With `structure_reuse_levels != 0`, recompute only the values of $AP$ and $RAP$ (SA and CLASSICAL) |
+| **Rebuild**     | `allow_rebuild` | `numeric_rebuild`          | `int`   | `1`     | With `structure_reuse_levels != 0`, recompute only the values of $AP$ and $RAP$ (SA and CLASSICAL; distributed SA too, decision 16) |
 | **Consolidation** | N/A (`mpi::repartition::scotch`) | `matrix_consolidation_partitioner` | `enum` | `RANK` | Rank groups of a consolidated `AGGREGATION` level: `RANK` (rank $i$ into $i \bmod$ groups) or `SCOTCH` (PT-Scotch partition of the rank graph) |
 | **Coarse solve** | N/A            | `exact_coarse_solve` (existing) | `int` | `0`   | Distributed `DENSE_LU_SOLVER` on the whole coarse matrix instead of block Jacobi; now also for SA (set with `algorithm` in the coarse solver's scope) |
 
@@ -441,7 +445,7 @@ To maintain ergonomic parity with AMGCL while integrating cleanly into AMGX, all
     - **Prolongator.** The tentative rows of the halo nodes are exchanged at a fixed width (global columns, values, and the coarse nullspace rows of their columns). $P_{tent}$ is extended to the FULL fine rows with the halo coarse columns after the owned ones. Smoothing and truncation are local, and P's manager comes from its global columns (`initialize_manager_from_global_col_indices`), as in distance-2 classical interpolation.
       - With $K > 1$ coarse unknowns per aggregate, each P row is padded with explicit zeros to whole aggregates. Truncation drops entries one by one, so otherwise the unknowns of an aggregate get different patterns in $RAP$, and the interior/boundary renumbering of the coarse level separates them. The coarse setup asserts that each node's unknowns stay consecutive.
     - **Coarse level.** The classical explicit-$P$ path step for step: `exchange_halo_rows_P`, R = Pᵀ over the owned rows with a stub manager, `csr_galerkin_product`, `exchange_RAP_ext`, compression of unused halo columns, `renumberMatrixOneRing`, `renumber_P_R`, `createOneRingHaloRows`. The user and coarse nullspaces follow the renumberings. Transfers use the masked products of the classical path.
-      - **Scope.** Scalar fine matrices, including interleaved systems with `aggregation_block_size`; distributed BSR input fails with a message. `NumericGalerkin` is off when distributed, while structure reuse works (resetup 0.65 → 0.24 s on 4 ranks). SA levels are not consolidated.
+      - **Scope.** Scalar fine matrices, including interleaved systems with `aggregation_block_size`, and BSR input (decision 16). Structure reuse works (resetup 0.65 → 0.24 s on 4 ranks, 0.06 s with the numeric-only rebuild of decision 16). SA levels are not consolidated.
     - **Coarse solve.** The distributed `DENSE_LU_SOLVER` is block Jacobi over the ranks unless `exact_coarse_solve=1`, which was gated to CLASSICAL. It now also accepts SMOOTHED_AGGREGATION, whose coarse levels carry the same `local_to_global_map`. The flag and `algorithm` are read in the coarse solver's own scope (see `src/configs/PCG_SA_ELASTICITY.json`).
       - This is what makes iterations independent of the rank count. With block Jacobi, elasticity took 33 / 41 / 50 / 54 iterations on 1–4 ranks; with the exact solve it takes 33 / 30 / 32 / 33. Poisson 64³ goes from 20 / 21 / 21 / 23 to 20 / 20 / 19 / 20.
       - AMGX also stops coarsening when the *smallest* rank falls below `min_coarse_rows`/`dense_lu_num_rows`; `use_sum_stopping_criteria=1` makes the hierarchy the same as on one GPU.
@@ -465,3 +469,38 @@ To maintain ergonomic parity with AMGCL while integrating cleanly into AMGX, all
 
       - **Iterations.** Consolidation raises the iterations, as single-root consolidation already did. Without it: 22–27. Single root: 24–32. RANK multi-root: 23–29. SCOTCH: 24–32. The true residuals agree with the tolerance in every run. On one GPU the partitioner cannot show its communication benefit; that is the P4.1 scaling probe.
       - **12-row `examples/matrix.mtx` on 4 ranks, stalling at 1.19: not a defect.** The last rank's 3×3 diagonal block of this nonsymmetric, indefinite matrix is singular. The single-level AMG is then a block Jacobi with an undefined block. Unpreconditioned FGMRES(5) stalls identically on 1, 2 and 4 ranks, so the distributed operator is consistent.
+
+16. **Distributed SA Hardening, ParILUT Start Pattern, MPI Regression Script (P4.2, P4.1, P1.3):**
+    
+    - **MPI regression script.** `ci/mpi_checks.sh`, run from `build/`, has 20 checks in about a minute on one GPU (ranks share it):
+      - distributed SA Poisson and elasticity on 1/2/4 ranks;
+      - BSR input;
+      - resetups, with and without structure reuse;
+      - numeric-only rebuild against full rebuild (identical iteration sequences);
+      - RANK/SCOTCH consolidation on 4 and 8 ranks.
+      
+      It checks the iterations against bands and the examples' true residual against bounds.
+    - **Distributed BSR input (P4.2).** The SA level's scalar copy of a distributed BSR matrix gets its own manager.
+      - `createTempManager` expands the B2L maps and halo offsets by the block size b. The partition offsets, halo ranges, base index, global ids and renumbering are scaled or expanded by b too.
+      - All distributed scalar code works on that copy: strength, spectral radius, tentative-row exchange, Galerkin product, `renumber_P_R`. Coarse levels were already scalar.
+      - Probe, 3×3-block elasticity on 1/2/3/4 ranks: 33 / 30 / 32 / 33 iterations, the same as the interleaved scalar upload, including resetups.
+      - **Hierarchy difference with BSR.** AMGX sets `min_coarse_rows = dense_lu_num_rows / block_dimy` of the finest level. For SA that unit is right at the first coarsening, where coarse vertices are counted in fine block rows, but too small below it, where SA levels are scalar. With 64 the BSR run builds one more, 42-row level, which costs up to 5 iterations at 3–4 ranks. Passing 3× `dense_lu_num_rows` reproduces the scalar hierarchy.
+      - Dividing by 1 for SA was tried and reverted: the first transition then compares fine block rows with scalar rows, and SAElasticity's plain BSR case collapsed to a single level.
+    - **Numeric-only distributed rebuild (P4.2).** A distributed resetup used to rebuild the whole coarse pattern; nsys on 4 ranks put the Galerkin chain at about 140 ms and the coarse renumbering at about 95 ms of 0.24 s.
+      - On structure-reuse levels with `numeric_rebuild != 0`, a full rebuild now also records the refill. It keeps P with its received halo rows and a `NumericGalerkin` for $R A P_{ext}$ (sorted patterns), plus two Ac position maps (keys: local row × global size + global column):
+        - one for each owned contribution;
+        - one for each contribution received from the neighbours, whose keys are exchanged once.
+      - **Refill.** The two SpGEMMs run on the kept patterns. The external rows' values go to their owners (point-to-point, sizes known), and everything is scattered into Ac's owned rows, neighbour by neighbour (deterministic).
+      - **Conditions.** The coarse numbering must have been left unchanged (renumbering identity), and the level's input A must keep its exact arrays, compared in full. A coarse A rebuilt in full has the same nnz in a different order, and an nnz-only check produced a 2% wrong coarse matrix. All ranks decide together with a reduction, and the exchanges use a duplicated communicator.
+      - **Measured** (elasticity 46,875 DOFs, 4 ranks): resetup 0.232 → 0.062 s from the third setup on. The second setup, which records, takes 0.35 s. Iterations and residuals are identical, and Ac matches a full rebuild within $7 \times 10^{-16}$ (relative) on every rank, level and setup.
+    - **SA coarse-level consolidation (P4.1): attempted, stopped.** The plan was to reuse the classical coarse-level glue.
+      - Its code is compiled out (`COARSE_CLA_CONSO=0`) and no longer compiled (`thrust_wrapper::fill` without its memory-space argument). After that fix, CLASSICAL PMIS with `amg_consolidation_flag=1` on 4 ranks aborts in `glue_matrices` (`MPI_Gatherv`, invalid count) at its first coarse glue.
+      - Reverted. SA consolidation needs that path repaired first (or a dedicated gather for SA levels), with its known hazards:
+        - a `MPI_COMM_WORLD` split per call that is never freed;
+        - contiguous groups only;
+        - idle ranks against collective coarse solves.
+    - **ParILUT start pattern (P1.3).**
+      - `ilut_initial_fill_level` k starts the threshold steps from the pattern of $A^{k+1}$ (the `factorPower` products), after one sweep.
+      - On the 65k probe: k = 1 reaches 9 iterations in 15 steps (0.168 s) instead of 20 (0.25 s); 13 iterations take 0.075–0.080 s with either start; k = 2 is slower.
+      - Asynchronous in-place sweeps gave identical iterations and no speed-up, so they were not kept.
+    - **P5.1** is still blocked by `ERR_NVGPUCTRPERM`.
