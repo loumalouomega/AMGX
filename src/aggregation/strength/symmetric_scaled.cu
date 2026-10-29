@@ -8,6 +8,7 @@
 // (see LICENSES/MIT.txt).
 
 #include <aggregation/strength/symmetric_scaled.h>
+#include <distributed/distributed_manager.h>
 #include <thrust_wrapper.h>
 #include <error.h>
 #include <cutil.h>
@@ -115,6 +116,45 @@ __global__ void fillFilteredScaledKernel(const IndexType *row_offsets, const Ind
     }
 }
 
+template <typename IndexType, typename ValueType>
+__global__ void haloStrengthKernel(const IndexType *row_offsets, const IndexType *col_indices, const ValueType *values,
+                                   const ValueType *diag, int num_rows, double eps_squared, bool *strong, ValueType *filtered_diag)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_rows; i += gridDim.x * blockDim.x)
+    {
+        const double eps_dia_i = eps_squared * (double) diag[i];
+        ValueType d_f = ValueType(0);
+
+        for (IndexType k = row_offsets[i]; k < row_offsets[i + 1]; k++)
+        {
+            const IndexType c = col_indices[k];
+            const ValueType v = values[k];
+
+            if (c >= num_rows) { strong[k] = eps_dia_i * (double) diag[c] < (double) v * (double) v; }
+
+            if (!strong[k]) { d_f += v; }
+        }
+
+        filtered_diag[i] = d_f;
+    }
+}
+
+// Owned rows plus the halo of the columns (distributed)
+template <class Mat>
+int fullSize(const Mat &A)
+{
+    int size = std::max((int) A.get_num_rows(), (int) A.get_num_cols());
+
+    if (A.is_matrix_distributed())
+    {
+        int offset, full;
+        A.getOffsetAndSizeForView(FULL, &offset, &full);
+        size = std::max(size, full);
+    }
+
+    return size;
+}
+
 } // anonymous namespace
 
 template <class T_Config>
@@ -128,19 +168,57 @@ void SymmetricScaledStrength<T_Config>::computeStrongConnections(const Matrix<TC
     }
 
     const int num_rows = A.get_num_rows();
-    MVector diag(num_rows);
+    const bool distributed = !A.is_matrix_singleGPU();
+    // Distributed: columns reach the halo, whose diagonal comes from the neighbours (the halo rows of
+    // A are identity rows with one ring)
+    MVector diag(distributed ? fullSize(A) : num_rows);
     strong.resize(A.get_num_nz());
     filtered_diag.resize(num_rows);
 
+    if (num_rows > 0)
+    {
+        extractDiagonalKernel <<< saNumBlocks(num_rows), SA_BLOCK_SIZE>>>(
+            A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(), num_rows, diag.raw());
+        cudaCheckError();
+    }
+
+    if (distributed)
+    {
+        diag.dirtybit = 1;
+        A.manager->exchange_halo(diag, diag.tag);
+    }
+
     if (num_rows == 0) { return; }
 
-    extractDiagonalKernel <<< saNumBlocks(num_rows), SA_BLOCK_SIZE>>>(
-        A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(), num_rows, diag.raw());
-    cudaCheckError();
     strongConnectionsKernel <<< saNumBlocks(num_rows), SA_BLOCK_SIZE>>>(
         A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(), diag.raw(), num_rows,
         eps_strong * eps_strong, strong.raw(), filtered_diag.raw());
     cudaCheckError();
+}
+
+template <class T_Config>
+void SymmetricScaledStrength<T_Config>::patchHaloStrength(const Matrix<TConfig> &A, double eps_strong, BVector &strong,
+        MVector &filtered_diag)
+{
+    const int num_rows = A.get_num_rows();
+    MVector diag(fullSize(A));
+
+    if (num_rows > 0)
+    {
+        extractDiagonalKernel <<< saNumBlocks(num_rows), SA_BLOCK_SIZE>>>(
+            A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(), num_rows, diag.raw());
+        cudaCheckError();
+    }
+
+    diag.dirtybit = 1;
+    A.manager->exchange_halo(diag, diag.tag);
+
+    if (num_rows > 0)
+    {
+        haloStrengthKernel <<< saNumBlocks(num_rows), SA_BLOCK_SIZE>>>(A.row_offsets.raw(), A.col_indices.raw(),
+                A.values.raw(), diag.raw(), num_rows, eps_strong * eps_strong, strong.raw(), filtered_diag.raw());
+        cudaCheckError();
+    }
 }
 
 template <class T_Config>
@@ -162,7 +240,7 @@ void SymmetricScaledStrength<T_Config>::buildFilteredScaledOperator(const Matrix
     const int nnz = row_counts[num_rows];
     S.set_initialized(0);
     S.addProps(CSR);
-    S.resize(num_rows, num_rows, nnz, 1, 1, 1);
+    S.resize(num_rows, A.is_matrix_distributed() ? fullSize(A) : num_rows, nnz, 1, 1, 1);
     thrust_wrapper::copy<TConfig::memSpace>(row_counts.begin(), row_counts.end(), S.row_offsets.begin());
     cudaCheckError();
 

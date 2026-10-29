@@ -76,7 +76,8 @@ __global__ void maxKeyRing1Kernel(const IndexType *row_offsets, const IndexType 
 
         for (IndexType k = row_offsets[i]; k < row_offsets[i + 1]; k++)
         {
-            if (strong[k])
+            // halo columns (distributed) are not aggregated: aggregates stay on their rank
+            if (strong[k] && col_indices[k] < num_rows)
             {
                 const IndexType c = col_indices[k];
                 const int64_t key = mis2Key(state[c], c, index_priority);
@@ -101,7 +102,7 @@ __global__ void maxKeyRing2AndUpdateKernel(const IndexType *row_offsets, const I
 
         for (IndexType k = row_offsets[i]; k < row_offsets[i + 1]; k++)
         {
-            if (strong[k] && k1[col_indices[k]] > best) { best = k1[col_indices[k]]; }
+            if (strong[k] && col_indices[k] < num_rows && k1[col_indices[k]] > best) { best = k1[col_indices[k]]; }
         }
 
         if ((int)(best & 0xFFFFFFFF) == i)
@@ -138,7 +139,7 @@ __global__ void assignToRootsKernel(const IndexType *row_offsets, const IndexTyp
         {
             const IndexType c = col_indices[k];
 
-            if (strong[k] && state[c] == MIS2_IN)
+            if (strong[k] && c < num_rows && state[c] == MIS2_IN)
             {
                 const int64_t key = mis2Key(MIS2_IN, c, index_priority);
 
@@ -168,7 +169,7 @@ __global__ void assignToNeighboursKernel(const IndexType *row_offsets, const Ind
             {
                 const IndexType c = col_indices[k];
 
-                if (strong[k] && aggregates_in[c] >= 0)
+                if (strong[k] && c < num_rows && aggregates_in[c] >= 0)
                 {
                     const int64_t key = mis2Key(0, c, index_priority);
 

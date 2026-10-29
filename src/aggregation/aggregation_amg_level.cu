@@ -2622,14 +2622,22 @@ void Aggregation_AMG_Level_Base<T_Config>::consolidateCoarseGridMatrix()
             this->m_consolidated_halo_offsets.resize(0);
             this->m_consolidated_B2L_maps.resize(0);
 
-            Ac.manager->B2L_rings.resize(num_consolidated_neighbors + 1);
+            // one ring per consolidated neighbour, sized from the B2L maps now owned by Ac's manager
+            // (consolidated_B2L_maps refers to the level's copy, cleared above)
+            Ac.manager->B2L_rings.resize(num_consolidated_neighbors);
 
             for (int i = 0; i < num_consolidated_neighbors; i++)
             {
                 Ac.manager->B2L_rings[i].resize(2);
                 Ac.manager->B2L_rings[i][0] = 0;
-                Ac.manager->B2L_rings[i][1] = consolidated_B2L_maps[i].size();
+                Ac.manager->B2L_rings[i][1] = Ac.manager->B2L_maps[i].size();
             }
+
+            // the fused gather of the halo exchanges uses the B2L offsets (needed once the consolidated
+            // level still has neighbours, i.e. with more than one root)
+            DistributedArranger<T_Config> *prep = new DistributedArranger<T_Config>;
+            prep->initialize_B2L_maps_offsets(Ac, 1);
+            delete prep;
         }
 
         Ac.manager->set_initialized(Ac.row_offsets);

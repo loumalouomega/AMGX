@@ -163,6 +163,7 @@ class AMG
         IndexType m_amg_consolidation_flag;
         IndexType m_consolidation_lower_threshold;
         IndexType m_consolidation_upper_threshold;
+        std::string m_consolidation_partitioner;   // RANK or SCOTCH (rank-to-root map of the consolidation)
         int m_sum_stopping_criteria;
         int m_structure_reuse_levels;
         int m_amg_host_levels_rows;

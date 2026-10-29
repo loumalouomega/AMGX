@@ -9,12 +9,17 @@
 
 #include <aggregation/sa_prolongation.h>
 #include <csr_multiply.h>
+#include <distributed/distributed_manager.h>
+#ifdef AMGX_WITH_MPI
+#include <mpi.h>
+#endif
 #include <thrust_wrapper.h>
 #include <error.h>
 #include <cutil.h>
 #include <util.h>
 
 #include <thrust/functional.h>
+#include <thrust/inner_product.h>
 #include <thrust/iterator/counting_iterator.h>
 
 #include <climits>
@@ -70,11 +75,11 @@ __global__ void spmvKernel(const IndexType *row_offsets, const IndexType *col_in
 }
 
 // Deterministic pseudo-random start vector with entries in [-1, 1]
-__global__ void hashVectorKernel(int n, double *x)
+__global__ void hashVectorKernel(int n, int64_t offset, double *x)
 {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
     {
-        unsigned int a = (unsigned int) i * 2654435761u + 0x9e3779b9u;
+        unsigned int a = (unsigned int)(i + offset) * 2654435761u + 0x9e3779b9u;
         a ^= a >> 16;
         a *= 0x85ebca6bu;
         a ^= a >> 13;
@@ -120,6 +125,95 @@ __global__ void jacobiOperatorKernel(const IndexType *row_offsets, const IndexTy
     }
 }
 
+
+// Row i of P = J P_tent when every row of P_tent has at most one entry: the entries J_ij p_j of the
+// row, merged by coarse column (sorted, at most SAP_MAX_ROW per row). Count pass (vals == NULL) and fill.
+const int SAP_MAX_ROW = 64;
+
+template <typename IndexType, typename ValueType>
+__global__ void singleEntryProductKernel(const IndexType *J_ro, const IndexType *J_ci, const ValueType *J_v, int num_rows,
+        const IndexType *T_ro, const IndexType *T_ci, const ValueType *T_v, const IndexType *P_ro, int *counts,
+        int *overflow, IndexType *P_ci, ValueType *P_v)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_rows; i += gridDim.x * blockDim.x)
+    {
+        IndexType cols[SAP_MAX_ROW];
+        ValueType vals[SAP_MAX_ROW];
+        int m = 0;
+        bool full = false;
+
+        for (IndexType k = J_ro[i]; k < J_ro[i + 1]; k++)
+        {
+            const IndexType j = J_ci[k];
+
+            if (T_ro[j] == T_ro[j + 1]) { continue; }
+
+            const IndexType c = T_ci[T_ro[j]];
+            const ValueType v = J_v[k] * T_v[T_ro[j]];
+            // insert into the sorted list, merging equal columns
+            int q = m;
+
+            while (q > 0 && cols[q - 1] > c) { q--; }
+
+            if (q > 0 && cols[q - 1] == c) { vals[q - 1] = vals[q - 1] + v; continue; }
+
+            if (m == SAP_MAX_ROW) { full = true; break; }
+
+            for (int r = m; r > q; r--) { cols[r] = cols[r - 1]; vals[r] = vals[r - 1]; }
+
+            cols[q] = c;
+            vals[q] = v;
+            m++;
+        }
+
+        if (P_v == NULL)
+        {
+            counts[i] = m;
+
+            if (full) { atomicExch(overflow, 1); }
+        }
+        else
+        {
+            for (int q = 0; q < m; q++) { P_ci[P_ro[i] + q] = cols[q]; P_v[P_ro[i] + q] = vals[q]; }
+        }
+    }
+}
+
+// Truncation: kept count and rescaling factor per row (count pass), then the kept entries scaled (fill)
+template <typename IndexType, typename ValueType>
+__global__ void truncateRowSumKernel(const IndexType *ro, const IndexType *ci, const ValueType *v, int num_rows,
+                                     double drop_tol, int *counts, const IndexType *new_ro, IndexType *new_ci, ValueType *new_v)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_rows; i += gridDim.x * blockDim.x)
+    {
+        double max_abs = 0.0;
+        ValueType sum = ValueType(0), kept_sum = ValueType(0);
+
+        for (IndexType k = ro[i]; k < ro[i + 1]; k++)
+        {
+            max_abs = fmax(max_abs, fabs((double) v[k]));
+            sum = sum + v[k];
+        }
+
+        const double threshold = drop_tol * max_abs;
+        int count = 0;
+
+        for (IndexType k = ro[i]; k < ro[i + 1]; k++)
+            if (fabs((double) v[k]) >= threshold) { kept_sum = kept_sum + v[k]; count++; }
+
+        if (new_v == NULL)
+        {
+            counts[i] = count;
+            continue;
+        }
+
+        const ValueType scale = (kept_sum == ValueType(0)) ? ValueType(1) : sum / kept_sum;
+        IndexType w = new_ro[i];
+
+        for (IndexType k = ro[i]; k < ro[i + 1]; k++)
+            if (fabs((double) v[k]) >= threshold) { new_ci[w] = ci[k]; new_v[w] = v[k] * scale; w++; }
+    }
+}
 
 template <typename IndexType, typename ValueType>
 __global__ void blockTentativeKernel(const int *aggregates, int num_rows, int b,
@@ -469,60 +563,107 @@ struct is_aggregated
     __host__ __device__ int operator()(int a) const { return a >= 0 ? 1 : 0; }
 };
 
-template <class DVector>
-double dotProduct(const DVector &x, const DVector &y)
+// <x, y> over the first n entries, summed over the partitions of comm when distributed
+template <class DVector, class Mat>
+double dotProduct(const DVector &x, const DVector &y, int n, const Mat *comm)
 {
-    return thrust_wrapper::transform_reduce<AMGX_device>(
-               amgx::thrust::counting_iterator<int>(0), amgx::thrust::counting_iterator<int>((int) x.size()),
-               dot_functor(x.raw(), y.raw()), 0.0, amgx::thrust::plus<double>());
+    double d = thrust_wrapper::transform_reduce<AMGX_device>(
+                   amgx::thrust::counting_iterator<int>(0), amgx::thrust::counting_iterator<int>(n),
+                   dot_functor(x.raw(), y.raw()), 0.0, amgx::thrust::plus<double>());
+
+    if (comm != NULL) { comm->manager->global_reduce_sum(&d); }
+
+    return d;
 }
 
 } // anonymous namespace
 
 template <class T_Config>
-double SAProlongation<T_Config>::estimateSpectralRadius(const Matrix<TConfig> &S, int power_iters)
+double SAProlongation<T_Config>::estimateSpectralRadius(const Matrix<TConfig> &S, int power_iters, const Matrix<TConfig> *comm)
 {
     typedef Vector<typename TConfig::template setVecPrec<AMGX_vecDouble>::Type> DVector;
+    // every partition takes part in the reductions, also one without neighbours
+    const Matrix<TConfig> *dist = (comm != NULL && comm->is_matrix_distributed() && comm->manager->get_num_partitions() > 1) ? comm : NULL;
     const int n = S.get_num_rows();
+    // the power-iteration vector carries the halo of S's columns
+    const int n_full = dist != NULL ? std::max(n, (int) S.get_num_cols()) : n;
 
-    if (n == 0) { return 0.0; }
+    if (dist == NULL && n == 0) { return 0.0; }
 
-    const int num_blocks = sapNumBlocks(n);
-    DVector b0(n), b1(n);
+    const int num_blocks = sapNumBlocks(std::max(n, 1));
+    DVector b0(n_full, 0.0), b1(std::max(n, 1));
 
     if (power_iters <= 0)
     {
         // Gershgorin disk theorem
-        absRowSumKernel <<< num_blocks, SAP_BLOCK_SIZE>>>(S.row_offsets.raw(), S.values.raw(), n, b0.raw());
-        cudaCheckError();
-        double radius = thrust_wrapper::reduce<AMGX_device>(b0.begin(), b0.end(), 0.0, amgx::thrust::maximum<double>());
-        cudaCheckError();
+        double radius = 0.0;
+
+        if (n > 0)
+        {
+            absRowSumKernel <<< num_blocks, SAP_BLOCK_SIZE>>>(S.row_offsets.raw(), S.values.raw(), n, b0.raw());
+            cudaCheckError();
+            radius = thrust_wrapper::reduce<AMGX_device>(b0.begin(), b0.begin() + n, 0.0, amgx::thrust::maximum<double>());
+            cudaCheckError();
+        }
+
+#ifdef AMGX_WITH_MPI
+
+        if (dist != NULL)
+        {
+            double global = radius;
+            MPI_Allreduce(&radius, &global, 1, MPI_DOUBLE, MPI_MAX, dist->manager->getComms()->get_mpi_comm());
+            radius = global;
+        }
+
+#endif
         return radius;
     }
 
     // Power iteration, radius = <S b0, b0> with ||b0|| = 1
-    hashVectorKernel <<< num_blocks, SAP_BLOCK_SIZE>>>(n, b0.raw());
-    cudaCheckError();
-    double b_norm = std::sqrt(dotProduct(b0, b0));
-    scaleVectorKernel <<< num_blocks, SAP_BLOCK_SIZE>>>(n, 1.0 / b_norm, b0.raw(), b0.raw());
-    cudaCheckError();
+    if (n > 0)
+    {
+        hashVectorKernel <<< num_blocks, SAP_BLOCK_SIZE>>>(n, dist != NULL ? dist->manager->base_index() : 0, b0.raw());
+        cudaCheckError();
+    }
+
+    double b_norm = std::sqrt(dotProduct(b0, b0, n, dist));
+
+    if (n > 0)
+    {
+        scaleVectorKernel <<< num_blocks, SAP_BLOCK_SIZE>>>(n, 1.0 / b_norm, b0.raw(), b0.raw());
+        cudaCheckError();
+    }
+
     double radius = 0.0;
 
     for (int iter = 0; iter < power_iters;)
     {
-        spmvKernel <<< num_blocks, SAP_BLOCK_SIZE>>>(S.row_offsets.raw(), S.col_indices.raw(), S.values.raw(),
-                n, b0.raw(), b1.raw());
-        cudaCheckError();
-        radius = dotProduct(b1, b0);
+        if (dist != NULL)
+        {
+            b0.dirtybit = 1;
+            dist->manager->exchange_halo(b0, b0.tag);
+        }
+
+        if (n > 0)
+        {
+            spmvKernel <<< num_blocks, SAP_BLOCK_SIZE>>>(S.row_offsets.raw(), S.col_indices.raw(), S.values.raw(),
+                    n, b0.raw(), b1.raw());
+            cudaCheckError();
+        }
+
+        radius = dotProduct(b1, b0, n, dist);
 
         if (++iter < power_iters)
         {
-            b_norm = std::sqrt(dotProduct(b1, b1));
+            b_norm = std::sqrt(dotProduct(b1, b1, n, dist));
 
             if (b_norm == 0.0) { break; }
 
-            scaleVectorKernel <<< num_blocks, SAP_BLOCK_SIZE>>>(n, 1.0 / b_norm, b1.raw(), b0.raw());
-            cudaCheckError();
+            if (n > 0)
+            {
+                scaleVectorKernel <<< num_blocks, SAP_BLOCK_SIZE>>>(n, 1.0 / b_norm, b1.raw(), b0.raw());
+                cudaCheckError();
+            }
         }
     }
 
@@ -571,7 +712,72 @@ void SAProlongation<T_Config>::smoothProlongator(Matrix<TConfig> &S, double omeg
 
     P.set_initialized(0);
     P.addProps(CSR);
+    // P_tent with at most one entry per row: P row by row (merging J's entries by coarse column)
+    const int tent_rows = P_tent.get_num_rows();
+    const bool single = tent_rows > 0 && P_tent.get_num_nz() <= tent_rows &&
+                        amgx::thrust::inner_product(P_tent.row_offsets.begin() + 1, P_tent.row_offsets.begin() + tent_rows + 1,
+                                P_tent.row_offsets.begin(), 0, amgx::thrust::maximum<int>(), amgx::thrust::minus<int>()) <= 1;
+
+    if (single && num_rows > 0)
+    {
+        IVector counts(num_rows + 1, 0), overflow(1, 0);
+        singleEntryProductKernel <<< sapNumBlocks(num_rows), SAP_BLOCK_SIZE>>>(S.row_offsets.raw(), S.col_indices.raw(),
+                S.values.raw(), num_rows, P_tent.row_offsets.raw(), P_tent.col_indices.raw(), P_tent.values.raw(),
+                (const IndexType *) NULL, counts.raw(), overflow.raw(), (IndexType *) NULL, (ValueTypeA *) NULL);
+        cudaCheckError();
+
+        if (overflow[0] == 0)
+        {
+            thrust_wrapper::exclusive_scan<TConfig::memSpace>(counts.begin(), counts.end(), counts.begin());
+            cudaCheckError();
+            const int nnz = counts[num_rows];
+            P.resize(num_rows, P_tent.get_num_cols(), nnz, 1, 1, 1);
+            thrust_wrapper::copy<TConfig::memSpace>(counts.begin(), counts.end(), P.row_offsets.begin());
+            singleEntryProductKernel <<< sapNumBlocks(num_rows), SAP_BLOCK_SIZE>>>(S.row_offsets.raw(), S.col_indices.raw(),
+                    S.values.raw(), num_rows, P_tent.row_offsets.raw(), P_tent.col_indices.raw(), P_tent.values.raw(),
+                    P.row_offsets.raw(), counts.raw(), overflow.raw(), P.col_indices.raw(), P.values.raw());
+            cudaCheckError();
+            P.computeDiagonal();
+            P.set_initialized(1);
+            return;
+        }
+    }
+
     CSR_Multiply<TConfig>::csr_multiply(S, P_tent, P, csr_workspace);
+}
+
+template <class T_Config>
+void SAProlongation<T_Config>::truncateRowSum(Matrix<TConfig> &P, double drop_tol)
+{
+    const int num_rows = P.get_num_rows();
+
+    if (num_rows == 0) { return; }
+
+    IVector counts(num_rows + 1, 0);
+    truncateRowSumKernel <<< sapNumBlocks(num_rows), SAP_BLOCK_SIZE>>>(P.row_offsets.raw(), P.col_indices.raw(),
+            P.values.raw(), num_rows, drop_tol, counts.raw(), (const IndexType *) NULL, (IndexType *) NULL, (ValueTypeA *) NULL);
+    cudaCheckError();
+    thrust_wrapper::exclusive_scan<TConfig::memSpace>(counts.begin(), counts.end(), counts.begin());
+    cudaCheckError();
+    const int nnz = counts[num_rows];
+
+    if (nnz == P.get_num_nz()) { return; }  // nothing dropped (as truncateByFactor, no rescaling)
+
+    Matrix<TConfig> T;
+    T.set_initialized(0);
+    T.addProps(CSR);
+    T.resize(num_rows, P.get_num_cols(), nnz, 1, 1, 1);
+    thrust_wrapper::copy<TConfig::memSpace>(counts.begin(), counts.end(), T.row_offsets.begin());
+    truncateRowSumKernel <<< sapNumBlocks(num_rows), SAP_BLOCK_SIZE>>>(P.row_offsets.raw(), P.col_indices.raw(),
+            P.values.raw(), num_rows, drop_tol, counts.raw(), T.row_offsets.raw(), T.col_indices.raw(), T.values.raw());
+    cudaCheckError();
+    P.set_initialized(0);
+    P.row_offsets.swap(T.row_offsets);
+    P.col_indices.swap(T.col_indices);
+    P.values.swap(T.values);
+    P.set_num_nz(nnz);
+    P.computeDiagonal();
+    P.set_initialized(1);
 }
 
 template <class T_Config>

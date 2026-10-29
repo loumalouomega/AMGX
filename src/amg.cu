@@ -19,6 +19,7 @@
 #include <amg_level.h>
 #include <amgx_c.h>
 #include <distributed/glue.h>
+#include <distributed/repartition.h>
 
 #include <misc.h>
 #include <string>
@@ -49,6 +50,7 @@ AMG<t_vecPrec, t_matPrec, t_indPrec>
     m_amg_consolidation_flag = cfg.getParameter<int>("amg_consolidation_flag", cfg_scope);
     m_consolidation_lower_threshold = cfg.getParameter<int>("matrix_consolidation_lower_threshold", cfg_scope);
     m_consolidation_upper_threshold = cfg.getParameter<int>("matrix_consolidation_upper_threshold", cfg_scope);
+    m_consolidation_partitioner = cfg.getParameter<std::string>("matrix_consolidation_partitioner", cfg_scope);
     m_sum_stopping_criteria = cfg.getParameter<int>("use_sum_stopping_criteria", cfg_scope);
     m_structure_reuse_levels = cfg.getParameter<int>("structure_reuse_levels", cfg_scope);
     m_amg_host_levels_rows = cfg.getParameter<int>("amg_host_levels_rows", cfg_scope);
@@ -306,13 +308,56 @@ class AMG_Setup
                             FatalError("Consolidation with classical path not supported)", AMGX_ERR_NOT_IMPLEMENTED);
                         }
 
+                        if (amg->m_cfg->AMG_Config::template getParameter<AlgorithmType>("algorithm", amg->m_cfg_scope) == SMOOTHED_AGGREGATION)
+                        {
+                            FatalError("Coarse-level consolidation is not implemented for SMOOTHED_AGGREGATION (leave matrix_consolidation_lower_threshold at 0)", AMGX_ERR_NOT_IMPLEMENTED);
+                        }
+
                         int new_num_parts;
                         bool want_neighbors = false;
                         level->getA().manager->computeDestinationPartitions(amg->m_consolidation_upper_threshold,
                                 avg_size, num_parts, new_num_parts, want_neighbors);
 
+                        // Groups of neighbouring ranks from the rank graph instead of rank i -> i % new_num_parts
+                        if (amg->m_consolidation_partitioner == "SCOTCH" && new_num_parts > 1 && new_num_parts < num_parts)
+                        {
+                            std::vector<int> rows_per_part(num_parts);
+                            IVector_h destination;
+                            int num_roots = 0;
+
+                            for (int i = 0; i < num_parts; i++) { rows_per_part[i] = partition_rows[i][0]; }
+
+                            if (computeDestinationPartitionsScotch(*level->getA().manager, rows_per_part, new_num_parts, destination, num_roots))
+                            {
+                                level->getA().manager->setDestinationPartitions(destination);
+                                level->getA().manager->setMyDestinationPartition(destination[level->getA().manager->global_id()]);
+                                new_num_parts = num_roots;
+                            }
+                            else if (level->getA().manager->global_id() == 0)
+                            {
+                                std::cout << "matrix_consolidation_partitioner=SCOTCH unavailable or failed, consolidating by rank numbers" << std::endl;
+                            }
+                        }
+
                         if (new_num_parts != num_parts)
                         {
+                            if (level->getA().manager->global_id() == 0)
+                            {
+                                std::stringstream ss;
+                                ss << "Level " << level->getLevelIndex() << " consolidated: " << num_parts << " --> " << new_num_parts
+                                   << " partitions (" << amg->m_consolidation_partitioner << ")";
+
+                                if (num_parts <= 64)
+                                {
+                                    ss << ", destinations";
+
+                                    for (int i = 0; i < num_parts; i++) { ss << " " << level->getA().manager->getDestinationPartitions()[i]; }
+                                }
+
+                                ss << std::endl;
+                                amgx_output(ss.str().c_str(), ss.str().length());
+                            }
+
                             level->setIsConsolidationLevel(true);
                             // Modify partition_rows so that non-consolidated partitions have 0 rows
                             // Root partitions have total number of rows to consolidate

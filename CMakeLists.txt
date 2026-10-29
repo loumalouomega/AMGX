@@ -161,6 +161,27 @@ endif (CMAKE_NO_MPI)
 
 message ("This is a MPI build:" ${MPI_FOUND})
 
+# PT-Scotch: graph-partitioned coarse-level consolidation (matrix_consolidation_partitioner=SCOTCH).
+# Found in the default paths or under PTSCOTCH_ROOT_DIR; CMAKE_NO_PTSCOTCH disables it.
+set(CMAKE_NO_PTSCOTCH false CACHE BOOL "Build without PT-Scotch")
+set(AMGX_WITH_PTSCOTCH false)
+
+if (MPI_FOUND AND NOT CMAKE_NO_PTSCOTCH)
+  find_path(PTSCOTCH_INCLUDE_DIR ptscotch.h HINTS ${PTSCOTCH_ROOT_DIR} PATH_SUFFIXES include include/scotch scotch)
+  find_library(PTSCOTCH_LIBRARY ptscotch HINTS ${PTSCOTCH_ROOT_DIR} PATH_SUFFIXES lib lib64)
+  find_library(SCOTCH_LIBRARY scotch HINTS ${PTSCOTCH_ROOT_DIR} PATH_SUFFIXES lib lib64)
+  find_library(PTSCOTCHERR_LIBRARY ptscotcherr HINTS ${PTSCOTCH_ROOT_DIR} PATH_SUFFIXES lib lib64)
+
+  if (PTSCOTCH_INCLUDE_DIR AND PTSCOTCH_LIBRARY AND SCOTCH_LIBRARY AND PTSCOTCHERR_LIBRARY)
+    set(AMGX_WITH_PTSCOTCH true)
+    set(PTSCOTCH_LIBRARIES ${PTSCOTCH_LIBRARY} ${SCOTCH_LIBRARY} ${PTSCOTCHERR_LIBRARY})
+    include_directories(${PTSCOTCH_INCLUDE_DIR})
+    set(CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS} -DAMGX_WITH_PTSCOTCH)
+  endif ()
+endif ()
+
+message ("PT-Scotch coarse repartitioning:" ${AMGX_WITH_PTSCOTCH})
+
 # Enable NVTX ranges on Linux
 if(NOT WIN32)
   set(NVTXRANGE_FLAG -DNVTX_RANGES)
@@ -268,6 +289,11 @@ if(MPI_FOUND)
     target_link_libraries(amgx   MPI::MPI_CXX)
     target_link_libraries(amgxsh MPI::MPI_CXX)
 endif(MPI_FOUND)
+
+if(AMGX_WITH_PTSCOTCH)
+    target_link_libraries(amgx   ${PTSCOTCH_LIBRARIES})
+    target_link_libraries(amgxsh ${PTSCOTCH_LIBRARIES})
+endif(AMGX_WITH_PTSCOTCH)
 
 # CMAKE_CUDA_ARCHITECTURES is inherited by all targets automatically
 

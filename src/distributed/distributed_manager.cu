@@ -5470,6 +5470,11 @@ void DistributedManagerBase<TConfig>::computeDestinationPartitions(INDEX_TYPE up
             }
         }
     }
+    else
+    {
+        // rank i merges into rank i % new_num_parts (each root keeps itself)
+        for (int i = 0; i < num_parts; i++) { m_destination_partitions[i] = dp[i]; }
+    }
 
     m_my_destination_part =  m_destination_partitions[global_id()];
 }

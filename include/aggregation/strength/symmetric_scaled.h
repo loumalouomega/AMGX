@@ -44,6 +44,10 @@ struct SymmetricScaledStrength
 
     // Builds S = D_f^{-1} A^F: the diagonal entry (always 1) and the strong
     // off-diagonals a_ij / d_f[i] of each row (0 when d_f[i] is zero, as in AMGCL).
+    // Distributed pointwise aggregation: strong flags of the halo couplings (which the point matrix
+    // leaves out) by the scalar criterion with the halo diagonal; the filtered diagonal is recomputed.
+    static void patchHaloStrength(const Matrix<TConfig> &A, double eps_strong, BVector &strong, MVector &filtered_diag);
+
     static void buildFilteredScaledOperator(const Matrix<TConfig> &A, const BVector &strong,
                                             const MVector &filtered_diag, Matrix<TConfig> &S);
 };

@@ -1,0 +1,50 @@
+{
+    "config_version": 2,
+    "determinism_flag": 1,
+    "solver": {
+        "preconditioner": {
+            "print_grid_stats": 1,
+            "algorithm": "SMOOTHED_AGGREGATION",
+            "solver": "AMG",
+            "smoother": {
+                "relaxation_factor": 0.5,
+                "scope": "jacobi",
+                "solver": "BLOCK_JACOBI",
+                "monitor_residual": 0,
+                "print_solve_stats": 0
+            },
+            "presweeps": 1,
+            "postsweeps": 1,
+            "aggregation_eps_strong": 0.08,
+            "aggregation_eps_decay": 0.5,
+            "sa_relaxation_factor": 0.67,
+            "sa_spectral_radius_iters": 4,
+            "sa_prolongator_drop_tol": 0.02,
+            "coarse_solver": {
+                "scope": "coarse",
+                "solver": "DENSE_LU_SOLVER",
+                "algorithm": "SMOOTHED_AGGREGATION",
+                "exact_coarse_solve": 1
+            },
+            "dense_lu_num_rows": 64,
+            "min_coarse_rows": 32,
+            "max_iters": 1,
+            "monitor_residual": 0,
+            "print_solve_stats": 0,
+            "scope": "amg",
+            "max_levels": 50,
+            "cycle": "V",
+            "use_sum_stopping_criteria": 1,
+            "aggregation_block_size": 3
+        },
+        "solver": "PCG",
+        "print_solve_stats": 1,
+        "obtain_timings": 1,
+        "max_iters": 200,
+        "monitor_residual": 1,
+        "convergence": "RELATIVE_INI",
+        "scope": "main",
+        "tolerance": 1e-08,
+        "norm": "L2"
+    }
+}

@@ -34,7 +34,8 @@ namespace aggregation
  *    (AMGX_matrix_set_nullspace) with the coarse nullspace passed to the next level
  *  - P = (I - omega D_f^{-1} A^F) P_tent, truncated with sa_prolongator_drop_tol
  *  - R = P^T, Ac = R A P, always scalar
- * Single GPU only.
+ * Distributed: rank-local aggregates, P's halo from the neighbours' tentative rows, the coarse
+ * level numbered as in the distributed classical path (scalar fine matrices only).
  **************************************************/
 template <class T_Config>
 class SA_AMG_Level_Base : public AMG_Level<T_Config>
@@ -98,6 +99,10 @@ class SA_AMG_Level_Base : public AMG_Level<T_Config>
         virtual void computeProlongationOperator() = 0;
         virtual void computeAOperator() = 0;
         void computeRestrictionOperator();
+        // More than one partition: the setup's reductions and exchanges are collective
+        bool isDistributed() const { return this->A->is_matrix_distributed() && this->A->manager->get_num_partitions() > 1; }
+        // Coarse numbering of the distributed path, the coarse nullspace permuted along
+        void renumberCoarseLevel();
         void printLevelInfo(int nnz_P_untruncated);
         // Scalar matrix the coarsening works on: A itself or its scalar expansion
         const Matrix<TConfig> &scalarA() const { return m_use_scalar_copy ? m_A_scalar : *this->A; }
@@ -162,6 +167,12 @@ class SA_AMG_Level< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec>
         void computeAggregates();
         void computeProlongationOperator();
         void computeAOperator();
+    private:
+        // Distributed (rank-local aggregates): P = (I - omega S) P_tent with the halo rows of P_tent
+        // received from the neighbours, P's manager from the global coarse column ids
+        void computeProlongationDistributed(Matrix<TConfig> &S, const Matrix<TConfig> &P_tent, void *wk, int &nnz_untruncated);
+        // Galerkin product with the external contributions, then the coarse level's numbering
+        void computeAOperatorDistributed(void *wk);
 };
 
 } // namespace aggregation

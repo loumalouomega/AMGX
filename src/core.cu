@@ -328,6 +328,10 @@ inline void registerParameters()
     // matrix_consolidation_lower_threshold and matrix_consolidation_upper_threshold are obsolete
     AMG_Config::registerParameter<int>("matrix_consolidation_lower_threshold", "Average number of rows at which matrices from different processes must be merged", 0);
     AMG_Config::registerParameter<int>("matrix_consolidation_upper_threshold", "Average number of rows that merged matrices from different processes should have", 1000);
+    std::vector<std::string> consolidation_partitioners;
+    consolidation_partitioners.push_back("RANK");
+    consolidation_partitioners.push_back("SCOTCH");
+    AMG_Config::registerParameter<std::string>("matrix_consolidation_partitioner", "how ranks are grouped when coarse levels are consolidated: rank i into rank i % groups, or a PT-Scotch partition of the rank graph (roots: the lowest rank of each group) <RANK|SCOTCH>", "RANK", consolidation_partitioners);
     //Register System Parameters (memory pools)
     AMG_Config::registerParameter<size_t>("device_mem_pool_size", "size of the device memory pool in bytes", 256 * 1024 * 1024);
     AMG_Config::registerParameter<size_t>("device_consolidation_pool_size", "size of the device memory pool for root partition in bytes", 256 * 1024 * 1024);
@@ -352,7 +356,7 @@ inline void registerParameters()
     AMG_Config::registerParameter<ViewType>("separation_interior", "separation for latency hiding and coloring/smoothing <ViewType>", INTERIOR, viewtype_values);
     AMG_Config::registerParameter<ViewType>("separation_exterior", "limit of calculations for coloring/smoothing <ViewType>", OWNED, viewtype_values);
     AMG_Config::registerParameter<int>("min_rows_latency_hiding", "number of rows at which to disable latency hiding, negative value means latency hiding is completely disabled", -1);
-    AMG_Config::registerParameter<int>("exact_coarse_solve", "flag that changes the dense LU coarse solve to solve the exact global problem for Classical AMG preconditioning <0=disable|1=enable>", 0, bool_flag_values);
+    AMG_Config::registerParameter<int>("exact_coarse_solve", "flag that changes the dense LU coarse solve to solve the exact global problem for Classical and smoothed aggregation AMG preconditioning <0=disable|1=enable>", 0, bool_flag_values);
     AMG_Config::registerParameter<int>("matrix_halo_exchange", "0 - No halo exchange on lower levels, 1 - just diagonal values, 2 - full", 0);
     std::vector<ColoringType> coloring_values;
     coloring_values.push_back(FIRST);

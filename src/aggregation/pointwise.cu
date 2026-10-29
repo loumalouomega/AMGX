@@ -83,8 +83,11 @@ __global__ void pointKeysKernel(const IndexType *row_offsets, const IndexType *c
     {
         for (IndexType k = row_offsets[i]; k < row_offsets[i + 1]; k++)
         {
-            keys[k] = (int64_t)(i / b) * num_points + col_indices[k] / b;
-            abs_values[k] = fabs(values[k]);
+            // halo columns (distributed) do not take part in the rank-local aggregation: they are
+            // folded into the diagonal entry with value 0, which leaves its maximum unchanged
+            const bool halo = col_indices[k] >= num_rows;
+            keys[k] = (int64_t)(i / b) * num_points + (halo ? i / b : col_indices[k] / b);
+            abs_values[k] = halo ? ValueType(0) : fabs(values[k]);
         }
     }
 }

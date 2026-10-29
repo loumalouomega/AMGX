@@ -676,8 +676,11 @@ DenseLUSolver(AMG_Config &cfg,
     allocMem(m_cuds_info, sizeof(int), false);
 
     // Determine if the scalable coarse solve optimisation is enabled
+    // (SMOOTHED_AGGREGATION builds its distributed coarse levels as the classical path does, with a
+    // local_to_global_map for the halo columns)
+    const AlgorithmType algorithm = cfg.getParameter<AlgorithmType>( "algorithm", cfg_scope);
     m_enable_exact_solve = (
-        cfg.getParameter<AlgorithmType>( "algorithm", cfg_scope) == CLASSICAL &&
+        (algorithm == CLASSICAL || algorithm == SMOOTHED_AGGREGATION) &&
         cfg.getParameter<int>( "exact_coarse_solve", cfg_scope) == 1);
 }
 
