@@ -35,14 +35,14 @@ No open debts. C1 (PBICGSTAB false convergence) and C2 (SA on BSR with multicolo
 
 AMGX natively supports classical AMG (Ruge-Stüben, PMIS/HMIS, aggressive coarsening), standard smoothers (Jacobi, block/CF Jacobi, Gauss-Seidel, Multicolor GS/DILU, ILU($k$), Chebyshev/KPZ polynomials), Krylov accelerators (CG, PCG, BiCGStab, GMRES, IDR($s$)), block/BSR operations, MPI rank consolidation with CUDA IPC, and setup structure reuse. **None of these are porting targets.**
 
-AMGX's `AGGREGATION` level uses **plain, unsmoothed aggregation with binary transfer operators** ($P \in \{0, 1\}^{n \times m}$). The `SMOOTHED_AGGREGATION` level (single GPU) now provides AMGCL's smoothed aggregation:
+AMGX's `AGGREGATION` level uses **plain, unsmoothed aggregation with binary transfer operators** ($P \in \{0, 1\}^{n \times m}$). The `SMOOTHED_AGGREGATION` level now provides AMGCL's smoothed aggregation, on one GPU and distributed with rank-local aggregates (decision 15):
 - symmetric strength filter
 - pointwise aggregation for BSR or interleaved scalar systems
 - near-nullspace QR prolongation (`AMGX_matrix_set_nullspace`, `AMGX_generate_rigid_body_modes`)
 - filtered-Jacobi smoothing with nullspace-preserving truncation
 - floating-point Galerkin product
 
-Over-interpolation is available on `AGGREGATION`. The distributed version is P4.2.
+Over-interpolation is available on `AGGREGATION`. What remains of the distributed version is its multi-node validation (P4.2).
 
 Coloring-free smoothers are also available (scalar, single GPU, setup on the GPU):
 - `SPAI0` (also BSR) and `SPAI1`
@@ -51,13 +51,13 @@ Coloring-free smoothers are also available (scalar, single GPU, setup on the GPU
 The goal of this section is to bring the remaining AMGCL components into AMGX's GPU pipeline: SA performance verification, advanced smoothers, Krylov accelerators and **Composite Physics Preconditioners**.
 
 ```
-   [SMOOTHED_AGGREGATION level, single GPU]  (shipped)
+   [SMOOTHED_AGGREGATION level, single GPU and MPI]  (shipped)
                      │
                      ▼
     [H100 / A100 Performance Verification] (P0.12)
                      │
                      ▼
-       [Distributed MPI Smoothed Aggregation] (P4.2)
+       [16-GPU Distributed SA Validation] (P4.2)
 ```
 
 ---
@@ -68,6 +68,11 @@ The goal of this section is to bring the remaining AMGCL components into AMGX's 
 
 - **Effort:** **S**
 - **Gap:** The SA setup kernels are functionally verified (unit tests `SA*` in `src/tests/smoothed_aggregation.cu`), but their absolute timing targets were set for data-center GPUs. They have only been measured on an RTX 2000 Ada laptop GPU (8 GB).
+  - The setup phases carry NVTX ranges (`sa_strength`, `sa_mis2`, `sa_filtered_operator`, `sa_spectral_radius`, `sa_tentative`, `sa_smooth_p`, `sa_truncate`).
+  - Optimized on RTX 2000 Ada (4.1M-row 7-point Laplacian, iterations unchanged): SA setup 0.443 → 0.33–0.35 s.
+    - Truncation 98 → 12 ms: a fused row-sum truncation (`SAProlongation::truncateRowSum`) replaces `Truncate::truncateByFactor`.
+    - Prolongator smoothing 49 → 25 ms: a row-merge path for single-entry tentative rows replaces the SpGEMM.
+  - What is left over all levels: MIS(2) 52–55 ms (wall, with its per-round convergence checks), strength 7.5 ms, strength + MIS kernels about 40 ms. Checking MIS convergence every 4 rounds instead of every round saved under 1 ms and was not kept.
 - **Specification:** Profile `strongConnectionsKernel`, the `MIS2Aggregates` kernels and `CSR_Multiply::csr_galerkin_product` on the target hardware. Optimize the thread-per-row kernels (strength, MIS rounds, nullspace truncation) to warp-per-row variants if they dominate.
 - **Probe:**
   - Strength plus MIS(2) aggregation of a 10M-row 7-point Laplacian in $< 15\text{ ms}$ on one H100. On RTX 2000 Ada, 4.1M rows take about 40 ms of kernel time over all levels.
@@ -89,10 +94,13 @@ The goal of this section is to bring the remaining AMGCL components into AMGX's 
   | Iterations | 37 | 23 | 15 | 12 | 10 | 9 | 9 |
   | Setup (s) | 0.04 | 0.05 | 0.06 | 0.09 | 0.16 | 0.23 | 0.07 |
 
+- **Tried and reverted (2026-10-29, RTX 2000 Ada):**
+  - Per-row shared-memory steps (one CTA per row: candidate gather, bitonic de-duplication, fused values and selection) instead of the global key sort and rank selection. 0.264 s at 20 sweeps against 0.233 s for the global path, after strided ownership and float |v| keys in shared memory. Occupancy is bounded by the per-row shared memory, and most rows are short.
+  - Fewer pattern-selection steps than sweeps (`ilut_pattern_steps`, values-only sweeps in between): 3 steps → 33 iterations (0.040 s), 5 → 21 (0.047 s), 8 → 14 (0.062 s). That is no better than plain sweeps at equal setup time.
+  - The probe needs about 20 selection steps on this matrix; at 4–20 ms per step the 0.07 s target is out of reach for ParILUT here.
 - **Specification:**
-  - Per-row candidate generation and de-duplication in shared memory (warp per row), replacing the global key sort.
-  - Selection by a per-row bitonic sort on |v| instead of O(len²) rank counting.
-  - An asynchronous Gauss-Seidel-style sweep variant behind `determinism_flag=0`.
+  - An asynchronous Gauss-Seidel-style sweep variant behind `determinism_flag=0`, which needs fewer steps.
+  - A better starting pattern (e.g. ILUP(1) values) to cut the number of selection steps.
 - **Probe:** ILUT on the 65k-row anisotropic convection-diffusion probe reaches AMGCL's GMRES(50) iteration count (9) with setup at most AMGCL's serial time (0.07 s) on RTX 2000 Ada.
 
 ---
@@ -114,18 +122,19 @@ All P3 items are closed; design choices and AMGCL-baseline measurements are in d
 #### P4.1 Graph-Partitioned Distributed Coarsening (ParMETIS / PT-Scotch Wrappers)
 
 - **Effort:** **L**
-- **Gap:** AMGX relies on a geometric or rank-based consolidation pass via CUDA IPC on deep levels. It lacks a graph-partitioning-based repartitioning pass for unstructured distributed meshes, causing extreme communication bottlenecks on deep coarse levels across thousands of GPUs.
-- **Specification:** Integrate external graph repartitioning calls (ParMETIS / PT-Scotch) at deep multigrid levels: when the number of unknowns per MPI rank falls below 2,000, trigger distributed graph repartitioning, gather the coarse matrix onto a reduced set of active ranks, and create an MPI communicator subset.
+- **Gap:** The graph-partitioned consolidation of `AGGREGATION` levels is implemented and verified on one GPU with up to 8 ranks (decision 15): `matrix_consolidation_partitioner=SCOTCH` groups neighbouring ranks with PT-Scotch when the rows per rank fall below `matrix_consolidation_lower_threshold` (reference config `src/configs/PCG_AGGREGATION_CONSOLIDATION.json`, threshold 2000). What is missing is the scaling evidence, which needs a cluster.
+  - Not in scope: the CLASSICAL glue path and SA levels (consolidation stops SA with an error).
 - **Probe:** Weak scaling test up to 256 GPUs on an unstructured tetrahedral mesh. Prove setup and solve time scalability efficiency $\ge 75\%$ from 8 to 256 GPUs on level 4 and deeper.
 
 #### P4.2 Distributed Smoothed Aggregation
 
 - **Effort:** **L**
-- **Dependencies:** Builds on the single-GPU `SMOOTHED_AGGREGATION` level (`src/aggregation/sa_amg_level.cu`); explicit-$P$ distributed machinery exists only on the classical path (`renumber_P_R`, `exchange_halo_rows_P`, `exchange_RAP_ext`).
-- **Specification:** Extend smoothed aggregation to MPI distributed matrices (`DistributedMatrix`):
-  - Distributed boundary exchange for halo-aggregate tentative prolongation.
-  - Parallel communication of off-rank near-nullspace orthonormalization vectors.
-  - Two-tier parallel distributed SpGEMM for $P^T A P$ across MPI ranks with overlapping GPU communication (NVLink/NCCL).
+- **Gap:** Distributed `SMOOTHED_AGGREGATION` is implemented (rank-local aggregates, halo tentative rows, the classical explicit-$P$ coarse path; decision 15) and verified with 1–4 MPI ranks sharing one GPU (`examples/amgx_mpi_sa_elasticity`).
+  - Iterations, 1/2/3/4 ranks, exact coarse solve, true residual $< 10^{-8}$ in every run:
+    - 7-point Poisson 64³: 20 / 20 / 19 / 20.
+    - Clamped elasticity, 46,875 DOFs, 6 rigid-body modes: 33 / 30 / 32 / 33.
+  - The ±2% criterion is met at 4 ranks. At 2 and 3 ranks elasticity takes 1–3 *fewer* iterations, since the aggregates depend on the partition.
+  - Not done: the 16-GPU run, and overlapping the halo exchanges of the Galerkin product with computation (the classical path's exchanges are synchronous).
 - **Probe:** Multi-GPU 3D Elasticity with 6 rigid-body modes across 16 GPUs (4 nodes $\times$ 4 H100s). Check that iteration counts are identical ($\pm 2\%$) to single-GPU execution with identical physical parameters.
 
 ---
@@ -169,10 +178,12 @@ Stage 3: Advanced Smoothers & Composite Preconditioners
   Remaining: [P1.3 ParILUT step throughput]
 
 Stage 4: Distributed Scaling, Cache Optimization, and Production Hardening
-  [P4.1 ParMETIS] ──► [P4.2 Distributed SA] ──► [P5.1 RCM Reorder, done; L2 measurement open] ──► [P5.2 Numeric Rebuild, done]
+  [P4.1 PT-Scotch consolidation, done; scaling probe open] ──► [P4.2 Distributed SA, done; 16-GPU probe open] ──► [P5.1 RCM Reorder, done; L2 measurement open] ──► [P5.2 Numeric Rebuild, done]
   Milestone: Weak scaling across 64+ GPUs maintains ≥ 75% parallel efficiency on unstructured meshes.
   P5 measured (decision 13): RCM 2.6-2.8x faster CG / AMG-PCG iterations on a randomly numbered 16.9M-cell
     serpentine (no change on lexicographic numbering); coefficient-only resetup 49% (SA) / 37% (classical) faster.
+  P4 measured on one GPU with up to 8 MPI ranks (decision 15): distributed SA within one iteration of single GPU
+    (Poisson, elasticity); multi-rank consolidation fixed and graph-partitioned. Scaling probes need a cluster.
 ```
 
 ---
@@ -216,6 +227,8 @@ To maintain ergonomic parity with AMGCL while integrating cleanly into AMGX, all
 | **Deflation**   | N/A             | `deflation_use_nullspace`  | `int`   | `0`     | Deflate the near-nullspace of `AMGX_matrix_set_nullspace` instead |
 | **Reorder**     | `adapter::reorder` | `reordering`            | `enum`  | `NONE`  | `RCM`: reverse Cuthill-McKee of the system before setup (top-level scope, single GPU) |
 | **Rebuild**     | `allow_rebuild` | `numeric_rebuild`          | `int`   | `1`     | With `structure_reuse_levels != 0`, recompute only the values of $AP$ and $RAP$ (SA and CLASSICAL) |
+| **Consolidation** | N/A (`mpi::repartition::scotch`) | `matrix_consolidation_partitioner` | `enum` | `RANK` | Rank groups of a consolidated `AGGREGATION` level: `RANK` (rank $i$ into $i \bmod$ groups) or `SCOTCH` (PT-Scotch partition of the rank graph) |
+| **Coarse solve** | N/A            | `exact_coarse_solve` (existing) | `int` | `0`   | Distributed `DENSE_LU_SOLVER` on the whole coarse matrix instead of block Jacobi; now also for SA (set with `algorithm` in the coarse solver's scope) |
 
 ---
 
@@ -419,3 +432,36 @@ To maintain ergonomic parity with AMGCL while integrating cleanly into AMGX, all
     - **P2.3 (not a defect).** AMGCL's LGMRES basis holds $M + K$ columns; AMGX used `gmres_n_restart` as the total. AMGX LGMRES(20,3) was therefore AMGCL's (17,3), which stalls identically in AMGCL: 0.918 after 3000 iterations, and (13,3) / (7,3) match AMGX (16,3) / (10,3) at 0.964 / 0.995.
       - With the basis now `gmres_n_restart` + K, LGMRES(20,3) with ILU(0) at Pe = 5000 takes **874** iterations (AMGCL 874, the same residual $9.09 \times 10^{-9}$); (30,3) takes 660 (AMGCL 660); Pe = 2000 takes 847 (AMGCL 847).
       - The inexact 5-sweep ILU(0) was not the cause: 30 and 60 sweeps stall the same way under the old sizes.
+
+15. **Distributed SA and Coarse-Level Consolidation (P4.2, P4.1): Design Choices and Measurements:**
+    
+    - **Rank-local aggregates (P4.2).** MIS(2) and its assignment passes ignore halo columns, as the `AGGREGATION` path does, so each aggregate lives on one rank. The setup's decisions are global so that every rank takes them together: the ε retry when no strong connection exists, and the end of the hierarchy (the level reports its fine size when the global aggregate count is 0).
+      - Strength uses the halo diagonal (one exchange). Pointwise aggregation keeps halo couplings out of the point matrix and gives them the scalar criterion afterwards.
+      - The spectral radius uses the distributed SpMV, global reductions, and a start vector hashed on global row ids, so it does not depend on the partition.
+    - **Prolongator.** The tentative rows of the halo nodes are exchanged at a fixed width (global columns, values, and the coarse nullspace rows of their columns). $P_{tent}$ is extended to the FULL fine rows with the halo coarse columns after the owned ones. Smoothing and truncation are local, and P's manager comes from its global columns (`initialize_manager_from_global_col_indices`), as in distance-2 classical interpolation.
+      - With $K > 1$ coarse unknowns per aggregate, each P row is padded with explicit zeros to whole aggregates. Truncation drops entries one by one, so otherwise the unknowns of an aggregate get different patterns in $RAP$, and the interior/boundary renumbering of the coarse level separates them. The coarse setup asserts that each node's unknowns stay consecutive.
+    - **Coarse level.** The classical explicit-$P$ path step for step: `exchange_halo_rows_P`, R = Pᵀ over the owned rows with a stub manager, `csr_galerkin_product`, `exchange_RAP_ext`, compression of unused halo columns, `renumberMatrixOneRing`, `renumber_P_R`, `createOneRingHaloRows`. The user and coarse nullspaces follow the renumberings. Transfers use the masked products of the classical path.
+      - **Scope.** Scalar fine matrices, including interleaved systems with `aggregation_block_size`; distributed BSR input fails with a message. `NumericGalerkin` is off when distributed, while structure reuse works (resetup 0.65 → 0.24 s on 4 ranks). SA levels are not consolidated.
+    - **Coarse solve.** The distributed `DENSE_LU_SOLVER` is block Jacobi over the ranks unless `exact_coarse_solve=1`, which was gated to CLASSICAL. It now also accepts SMOOTHED_AGGREGATION, whose coarse levels carry the same `local_to_global_map`. The flag and `algorithm` are read in the coarse solver's own scope (see `src/configs/PCG_SA_ELASTICITY.json`).
+      - This is what makes iterations independent of the rank count. With block Jacobi, elasticity took 33 / 41 / 50 / 54 iterations on 1–4 ranks; with the exact solve it takes 33 / 30 / 32 / 33. Poisson 64³ goes from 20 / 21 / 21 / 23 to 20 / 20 / 19 / 20.
+      - AMGX also stops coarsening when the *smallest* rank falls below `min_coarse_rows`/`dense_lu_num_rows`; `use_sum_stopping_criteria=1` makes the hierarchy the same as on one GPU.
+    - *Measured (P4.2), one RTX 2000 Ada, ranks sharing it (`mpirun --oversubscribe`), `examples/amgx_mpi_sa_elasticity` with the true residual:* Poisson 64³ 20 / 20 / 19 / 20 iterations on 1–4 ranks. Clamped elasticity 24³ elements (46,875 DOFs): 33 / 30 / 32 / 33 with the 6 rigid-body modes, 59 / 58 / 56 / 59 without them (pointwise, 3 unknowns per node).
+    - **Consolidation fixes (P4.1).** Three defects kept multi-root consolidation of `AGGREGATION` levels from ever running:
+      - `computeDestinationPartitions` did not store its rank → root map with `wantNeighbors=false` (the only caller's setting). Every rank merged onto rank 0 whatever `matrix_consolidation_upper_threshold` asked for.
+      - The consolidated level's `B2L_rings` had one entry too many and were sized from the level's B2L copy, which had just been cleared. The next consolidation crashed in the halo exchange.
+      - The consolidated level never initialized its B2L offsets (`initialize_B2L_maps_offsets`), so the first solve with neighbours left crashed in `gather_B2L_v2`.
+    - **SCOTCH partitioner** (`include/distributed/repartition.h`). The ranks are graph vertices, weighted by the rows they bring to the consolidated level; their neighbours are edges, weighted by the halo sent plus received. `SCOTCH_dgraphPart` splits the graph into the groups the thresholds ask for, and every rank merges into the lowest rank of its group, so rank 0 stays active and its output covers the hierarchy.
+      - It fails over to RANK if PT-Scotch is absent (`CMAKE_NO_PTSCOTCH`, or not found) or the rank graph is not symmetric.
+      - PT-Scotch rather than ParMETIS: the user's choice, with a free licence and an MPI-native API.
+    - *Measured (P4.1), AGGREGATION + PCG, consolidation 600/700–1300:*
+      - **Groups.** SCOTCH groups neighbouring ranks where RANK's $i \bmod g$ does not:
+
+        | Rank layout | RANK groups | SCOTCH groups |
+        |---|---|---|
+        | 4×1×1 strip | {0,2} {1,3} | {0,1} {2,3} |
+        | 4×2×1 | x even / odd | x ∈ {0,1} / {2,3} |
+        | 8-rank chain | {0,2,4,6} {1,3,5,7} | {0–3} {4–7} |
+        | 2×2×2 (both connected) | x halves | z halves |
+
+      - **Iterations.** Consolidation raises the iterations, as single-root consolidation already did. Without it: 22–27. Single root: 24–32. RANK multi-root: 23–29. SCOTCH: 24–32. The true residuals agree with the tolerance in every run. On one GPU the partitioner cannot show its communication benefit; that is the P4.1 scaling probe.
+      - **12-row `examples/matrix.mtx` on 4 ranks, stalling at 1.19: not a defect.** The last rank's 3×3 diagonal block of this nonsymmetric, indefinite matrix is singular. The single-level AMG is then a block Jacobi with an undefined block. Unpreconditioned FGMRES(5) stalls identically on 1, 2 and 4 ranks, so the distributed operator is consistent.
