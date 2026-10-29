@@ -11,6 +11,7 @@
 #     --debug         Build Debug configuration
 #     --profile       Build Profile configuration
 #     --no-mpi        Disable MPI support
+#     --no-ptscotch   Build without PT-Scotch (coarse repartitioning by rank numbers only)
 #     --arch <list>   CUDA architectures (e.g., "86;89;90;100;120")
 #     --generator <g> CMake generator (default: "Ninja")
 #     --help          Show this help message
@@ -33,6 +34,7 @@ Options:
   --debug         Build Debug configuration
   --profile       Build Profile configuration
   --no-mpi        Disable MPI support (single GPU build)
+  --no-ptscotch   Build without PT-Scotch, even if it is installed
   --arch <list>   CUDA architectures to target
                   Default: "86;89;90;100;120"
                   Example: --arch "80;90;100"
@@ -64,6 +66,7 @@ EOF
 # Default configuration values
 BUILD_TYPE="Release"
 CMAKE_NO_MPI="OFF"
+CMAKE_NO_PTSCOTCH="OFF"
 CUDA_ARCHITECTURES="86;89;90;100;120"
 CMAKE_GENERATOR="Ninja"
 CMAKE_INSTALL_PREFIX=""
@@ -86,6 +89,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-mpi)
             CMAKE_NO_MPI="ON"
+            shift
+            ;;
+        --no-ptscotch)
+            CMAKE_NO_PTSCOTCH="ON"
             shift
             ;;
         --arch)
@@ -119,6 +126,7 @@ Source Directory:    $SOURCE_DIR
 Build Type:          $BUILD_TYPE
 CUDA Architectures:  $CUDA_ARCHITECTURES
 MPI Disabled:        $CMAKE_NO_MPI
+PT-Scotch Disabled:  $CMAKE_NO_PTSCOTCH
 CMake Generator:     $CMAKE_GENERATOR
 ============================================================================
 
@@ -151,7 +159,7 @@ fi
 echo "Running CMake configuration..."
 echo
 
-cmake -G "$CMAKE_GENERATOR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES" -DCMAKE_NO_MPI="$CMAKE_NO_MPI" ${CMAKE_INSTALL_PREFIX:+-DCMAKE_INSTALL_PREFIX="$CMAKE_INSTALL_PREFIX"} "$SOURCE_DIR"
+cmake -G "$CMAKE_GENERATOR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES" -DCMAKE_NO_MPI="$CMAKE_NO_MPI" -DCMAKE_NO_PTSCOTCH="$CMAKE_NO_PTSCOTCH" ${CMAKE_INSTALL_PREFIX:+-DCMAKE_INSTALL_PREFIX="$CMAKE_INSTALL_PREFIX"} "$SOURCE_DIR"
 
 if [ $? -ne 0 ]; then
     echo
