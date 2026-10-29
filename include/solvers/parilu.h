@@ -68,7 +68,10 @@ class ParILUFactor
         typedef typename TConfig::MatPrec ValueTypeA;
         typedef Vector<typename TConfig::template setVecPrec<AMGX_vecDouble>::Type> DVector;
 
-        ParILUFactor() : m_n(0), m_nnz(0), m_power_valid(false) {}
+        ParILUFactor() : m_n(0), m_nnz(0), m_power_valid(false), m_initial_level(0) {}
+
+        // ParILUT starts from the pattern of A^(initial_level+1) (0: the pattern of A)
+        void setInitialFillLevel(int initial_level) { m_initial_level = initial_level; }
 
         // ILU on the pattern of A^(level+1); the pattern is kept for refactorPower
         void factorPower(const Matrix<TConfig> &A, int level, int sweeps, Matrix<TConfig> &L, Matrix<TConfig> &U);
@@ -83,6 +86,7 @@ class ParILUFactor
     private:
         int m_n, m_nnz;
         bool m_power_valid;
+        int m_initial_level;
         // A: sorted keys with their positions in A, row statistics, a copy of its pattern
         I64Vector m_A_keys;
         IVector m_A_pos, m_A_ro, m_A_ci, m_len_lower, m_len_upper;
@@ -99,6 +103,8 @@ class ParILUFactor
         DVector m_thresholds;
 
         void prepareA(const Matrix<TConfig> &A);
+        // Sorted keys of the pattern of A^(level+1) (unit-valued SpGEMM powers)
+        void powerKeys(const Matrix<TConfig> &A, int level, I64Vector &keys);
         void patternFromKeys(const I64Vector &keys, int nnz);
         void gatherAValues(const Matrix<TConfig> &A);
         void initValues();

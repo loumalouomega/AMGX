@@ -8,8 +8,8 @@
    assembles its rows with global column indices, uploads them with contiguous partition offsets
    and, for elasticity, sets the rigid body modes of its nodes. The displacement unknowns are
    interleaved scalar rows: the AMG scope of the config needs aggregation_block_size=3 (see
-   src/configs/PCG_SA_ELASTICITY.json). After the solve the true residual ||b - A x|| / ||b|| is
-   computed. */
+   src/configs/PCG_SA_ELASTICITY.json); -bsr uploads them as 3 x 3 blocks instead. After the solve
+   the true residual ||b - A x|| / ||b|| is computed. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +34,30 @@ static void print_callback(const char *msg, int length)
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
     if (rank == 0) { printf("%s", msg); }
+}
+
+/* 3 x 3 blocks of the interleaved scalar rows: the three rows of a node have the same neighbour
+   nodes, each with its three columns in order */
+static void toBSR(int n_nodes, const int *row_ptrs, const int64_t *cols, const double *vals, int *brp,
+                  int64_t *bcols, double *bvals)
+{
+    brp[0] = 0;
+
+    for (int node = 0; node < n_nodes; node++)
+    {
+        const int len = (row_ptrs[3 * node + 1] - row_ptrs[3 * node]) / 3;
+
+        for (int q = 0; q < len; q++)
+        {
+            const int e = brp[node] + q;
+            bcols[e] = cols[row_ptrs[3 * node] + 3 * q] / 3;
+
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++) { bvals[(size_t) e * 9 + r * 3 + c] = vals[row_ptrs[3 * node + r] + 3 * q + c]; }
+        }
+
+        brp[node + 1] = brp[node] + len;
+    }
 }
 
 static int findParamIndex(char **argv, int argc, const char *parm)
@@ -113,6 +137,7 @@ int main(int argc, char **argv)
     int pidx, nx = 16, ny = 16, nz = 16;
     const int poisson = findParamIndex(argv, argc, "-poisson") != -1;
     const int use_nullspace = !poisson && findParamIndex(argv, argc, "-no-nullspace") == -1;
+    const int bsr = !poisson && findParamIndex(argv, argc, "-bsr") != -1;
 
     if ((pidx = findParamIndex(argv, argc, "-n")) != -1 && pidx + 3 < argc)
     {
@@ -125,7 +150,7 @@ int main(int argc, char **argv)
     {
         if (rank == 0)
         {
-            printf("Usage: mpirun -n N ./amgx_mpi_sa_elasticity -c config.json [-n nx ny nz] [-poisson] [-no-nullspace] [-resetup] [-amg \"param=value ...\"]\n");
+            printf("Usage: mpirun -n N ./amgx_mpi_sa_elasticity -c config.json [-n nx ny nz] [-poisson] [-no-nullspace] [-bsr] [-resetup [k]] [-amg \"param=value ...\"]\n");
         }
 
         MPI_Finalize();
@@ -243,12 +268,29 @@ int main(int argc, char **argv)
 
     int64_t *offsets = (int64_t *) malloc((nranks + 1) * sizeof(int64_t));
 
-    for (int p = 0; p <= nranks; p++) { offsets[p] = (int64_t)((int64_t) pz * p / nranks) * px * py * bs; }
+    /* block rows of the upload: scalar rows, or nodes with -bsr */
+    const int ub = bsr ? 3 : 1, n_up = n / ub;
+    int *brp = NULL;
+    int64_t *bcols = NULL;
+    double *bvals = NULL;
+
+    if (bsr)
+    {
+        brp = (int *) malloc((n_nodes + 1) * sizeof(int));
+        bcols = (int64_t *) malloc((size_t)(nnz / 9 + 1) * sizeof(int64_t));
+        bvals = (double *) malloc((size_t)(nnz + 1) * sizeof(double));
+        toBSR(n_nodes, row_ptrs, cols, vals, brp, bcols, bvals);
+    }
+
+    for (int p = 0; p <= nranks; p++) { offsets[p] = (int64_t)((int64_t) pz * p / nranks) * px * py * bs / ub; }
 
     AMGX_distribution_handle dist;
     AMGX_distribution_create(&dist, cfg);
     AMGX_distribution_set_partition_data(dist, AMGX_DIST_PARTITION_OFFSETS, offsets);
-    AMGX_matrix_upload_distributed(A, n_global, n, nnz, 1, 1, row_ptrs, cols, vals, NULL, dist);
+
+    if (bsr) { AMGX_matrix_upload_distributed(A, n_global / 3, n_nodes, brp[n_nodes], 3, 3, brp, bcols, bvals, NULL, dist); }
+    else { AMGX_matrix_upload_distributed(A, n_global, n, nnz, 1, 1, row_ptrs, cols, vals, NULL, dist); }
+
     AMGX_distribution_destroy(dist);
 
     if (use_nullspace)
@@ -267,12 +309,14 @@ int main(int argc, char **argv)
     AMGX_vector_bind(x, A);
     AMGX_vector_bind(b, A);
     AMGX_vector_bind(y, A);
-    AMGX_vector_upload(x, n, 1, zeros);
-    AMGX_vector_upload(b, n, 1, rhs);
-    AMGX_vector_upload(y, n, 1, zeros);
-    /* -resetup: a second solve after the coefficients changed (diagonal shift), with AMGX_solver_resetup */
-    const int num_solves = findParamIndex(argv, argc, "-resetup") != -1 ? 2 : 1;
-    const int64_t first_row = offsets[rank];
+    AMGX_vector_upload(x, n_up, ub, zeros);
+    AMGX_vector_upload(b, n_up, ub, rhs);
+    AMGX_vector_upload(y, n_up, ub, zeros);
+    /* -resetup [k]: k more solves (default 1), each after the coefficients changed (diagonal shift),
+       with AMGX_solver_resetup */
+    const int ridx = findParamIndex(argv, argc, "-resetup");
+    const int num_solves = ridx == -1 ? 1 : 1 + ((ridx + 1 < argc && atoi(argv[ridx + 1]) > 0) ? atoi(argv[ridx + 1]) : 1);
+    const int64_t first_row = offsets[rank] * ub;   /* first scalar row of this rank */
     double *Ax = (double *) malloc((n > 0 ? n : 1) * sizeof(double));
     AMGX_SOLVE_STATUS status = AMGX_SOLVE_SUCCESS;
 
@@ -285,8 +329,14 @@ int main(int argc, char **argv)
                 for (int k = row_ptrs[i]; k < row_ptrs[i + 1]; k++)
                     if (cols[k] == first_row + i) { vals[k] *= 1.5; }
 
-            AMGX_matrix_replace_coefficients(A, n, nnz, vals, NULL);
-            AMGX_vector_upload(x, n, 1, zeros);
+            if (bsr)
+            {
+                toBSR(n_nodes, row_ptrs, cols, vals, brp, bcols, bvals);
+                AMGX_matrix_replace_coefficients(A, n_nodes, brp[n_nodes], bvals, NULL);
+            }
+            else { AMGX_matrix_replace_coefficients(A, n, nnz, vals, NULL); }
+
+            AMGX_vector_upload(x, n_up, ub, zeros);
             AMGX_solver_resetup(solver, A);
         }
 
@@ -324,6 +374,7 @@ int main(int argc, char **argv)
     AMGX_resources_destroy(rsrc);
     AMGX_SAFE_CALL(AMGX_config_destroy(cfg));
     AMGX_SAFE_CALL(AMGX_finalize());
+    free(brp); free(bcols); free(bvals);
     free(row_ptrs); free(cols); free(vals); free(rhs); free(coords); free(offsets); free(zeros); free(Ax);
     MPI_Finalize();
     return status == AMGX_SOLVE_SUCCESS ? 0 : 1;

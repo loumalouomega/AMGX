@@ -33,6 +33,7 @@ ParILUSolver_Base<T_Config>::ParILUSolver_Base(AMG_Config &cfg, const std::strin
     m_fill_factor = cfg.AMG_Config::template getParameter<double>("ilut_fill_factor", cfg_scope);
     m_fill_level = cfg.AMG_Config::template getParameter<int>("ilup_fill_level", cfg_scope);
     m_sweeps = cfg.AMG_Config::template getParameter<int>("ilu_factor_sweeps", cfg_scope);
+    m_factor.setInitialFillLevel(cfg.AMG_Config::template getParameter<int>("ilut_initial_fill_level", cfg_scope));
 
     // Variant defaults (decision 14): ParILU sweeps are cheap and hard problems need many; ParILUT
     // sweeps cost more and saturate earlier

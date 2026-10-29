@@ -103,9 +103,12 @@ class SA_AMG_Level_Base : public AMG_Level<T_Config>
         bool isDistributed() const { return this->A->is_matrix_distributed() && this->A->manager->get_num_partitions() > 1; }
         // Coarse numbering of the distributed path, the coarse nullspace permuted along
         void renumberCoarseLevel();
+        // Distributed: after the coarse level is numbered (records what a numeric-only rebuild needs)
+        virtual void finishDistributedCoarseLevel() {}
         void printLevelInfo(int nnz_P_untruncated);
         // Scalar matrix the coarsening works on: A itself or its scalar expansion
         const Matrix<TConfig> &scalarA() const { return m_use_scalar_copy ? m_A_scalar : *this->A; }
+        Matrix<TConfig> &scalarA() { return m_use_scalar_copy ? m_A_scalar : *this->A; }
         // Unknowns per coarse node: the nullspace size, or the block size without nullspace
         int coarseBlockSize() const { return m_nullspace_cols > 0 ? m_nullspace_cols : m_block_size; }
 
@@ -113,6 +116,7 @@ class SA_AMG_Level_Base : public AMG_Level<T_Config>
         Matrix<TConfig> m_A_scalar;
         NumericGalerkin<TConfig> m_galerkin;   // numeric-only Galerkin product on structure-reuse levels
         bool m_use_scalar_copy;
+        bool m_coarse_refilled;             // distributed Ac refilled numerically: its numbering is unchanged
         int m_block_size;
         int m_inherited_block_size;
         int m_nullspace_cols;
@@ -162,7 +166,8 @@ class SA_AMG_Level< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec>
         typedef TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> TConfig;
         typedef AMG<t_vecPrec, t_matPrec, t_indPrec> AMG_Class;
         typedef SA_AMG_Level_Base<TConfig> Base;
-        SA_AMG_Level(AMG_Class *amg, ThreadManager *tmng) : SA_AMG_Level_Base<TConfig>(amg, tmng) {}
+        SA_AMG_Level(AMG_Class *amg, ThreadManager *tmng) : SA_AMG_Level_Base<TConfig>(amg, tmng), m_refill_ready(false), m_capture(false), m_captured(false), m_refill_comm(NULL) {}
+        ~SA_AMG_Level();
     protected:
         void computeAggregates();
         void computeProlongationOperator();
@@ -173,6 +178,27 @@ class SA_AMG_Level< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec>
         void computeProlongationDistributed(Matrix<TConfig> &S, const Matrix<TConfig> &P_tent, void *wk, int &nnz_untruncated);
         // Galerkin product with the external contributions, then the coarse level's numbering
         void computeAOperatorDistributed(void *wk);
+        // Scalar manager for the scalar copy of a distributed BSR matrix (A's manager expanded by its block size)
+        void attachScalarManager();
+        void finishDistributedCoarseLevel();
+        // Numeric-only rebuild of a distributed Ac on a structure-reuse level: R (A P_ext) on the kept
+        // sorted patterns, the external rows' values to the neighbours, everything scattered into Ac
+        // through position maps recorded once (see buildDistributedRefill)
+        void buildDistributedRefill();
+        void refillDistributed();
+
+        NumericGalerkin<TConfig> m_dist_galerkin;
+        Matrix<TConfig> m_P_ext, m_RAP_full;          // P with its received halo rows; R A P_ext
+        typename Base::IVector m_own_dst, m_recv_dst; // Ac positions of the owned and received entries
+        std::vector<int> m_xchg_neighbors, m_send_begin, m_send_end, m_recv_count;
+        typename Base::IVector m_refill_a_ro, m_refill_a_ci;   // A's pattern when the record was made
+        bool sameRefillPattern(const Matrix<TConfig> &A) const;
+        bool m_refill_ready;
+        // captured from the full distributed Galerkin product for the next build
+        bool m_capture, m_captured;
+        std::vector<int> m_cap_neighbors, m_cap_halo_offsets;
+        Vector<typename TConfig::template setVecPrec<AMGX_vecInt64>::Type> m_cap_l2g;
+        void *m_refill_comm;                          // MPI_Comm of the refill exchanges (a duplicate)
 };
 
 } // namespace aggregation

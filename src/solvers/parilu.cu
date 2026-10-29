@@ -1053,8 +1053,31 @@ void ParILUFactor<T_Config>::factorPower(const Matrix<TConfig> &A, int level, in
 {
     typedef PatternOps<TConfig> Ops;
     prepareA(A);
-    // Pattern of A^(level+1) with the diagonal, built once (products of the unit-valued pattern)
+    // Pattern of A^(level+1) with the diagonal, built once
     I64Vector keys, diag_keys(m_n), S;
+    powerKeys(A, level, keys);
+
+    if (m_n > 0)
+    {
+        diagonalKeysKernel <<< piluNumBlocks(m_n), PILU_BLOCK_SIZE>>>(m_n, diag_keys.raw());
+        cudaCheckError();
+    }
+
+    Ops::merge(keys, diag_keys, S);
+    patternFromKeys(S, (int) S.size());
+    gatherAValues(A);
+    initValues();
+
+    for (int s = 0; s < sweeps; s++) { sweep(); }
+
+    splitLU(L, U);
+    m_power_valid = true;
+}
+
+template <class T_Config>
+void ParILUFactor<T_Config>::powerKeys(const Matrix<TConfig> &A, int level, I64Vector &keys)
+{
+    typedef PatternOps<TConfig> Ops;
     MVector unit_vals;
     Ops::toKeys(A, keys, unit_vals, true);
 
@@ -1078,22 +1101,6 @@ void ParILUFactor<T_Config>::factorPower(const Matrix<TConfig> &A, int level, in
         CSR_Multiply<TConfig>::csr_workspace_delete(wk);
         Ops::toKeys(power, keys, unit_vals);
     }
-
-    if (m_n > 0)
-    {
-        diagonalKeysKernel <<< piluNumBlocks(m_n), PILU_BLOCK_SIZE>>>(m_n, diag_keys.raw());
-        cudaCheckError();
-    }
-
-    Ops::merge(keys, diag_keys, S);
-    patternFromKeys(S, (int) S.size());
-    gatherAValues(A);
-    initValues();
-
-    for (int s = 0; s < sweeps; s++) { sweep(); }
-
-    splitLU(L, U);
-    m_power_valid = true;
 }
 
 template <class T_Config>
@@ -1144,8 +1151,9 @@ void ParILUFactor<T_Config>::factorThreshold(const Matrix<TConfig> &A, double dr
         cudaCheckError();
     }
 
-    // Start from ILU(0) values on the pattern of A with the diagonal
-    I64Vector diag_keys(n), S;
+    // Start from ILU(0) values on the pattern of A (or of A^(k+1), ilut_initial_fill_level) with the
+    // diagonal; a richer start needs fewer selection steps to reach the fill of deep rows
+    I64Vector diag_keys(n), S, start_keys;
 
     if (n > 0)
     {
@@ -1153,10 +1161,15 @@ void ParILUFactor<T_Config>::factorThreshold(const Matrix<TConfig> &A, double dr
         cudaCheckError();
     }
 
-    Ops::merge(m_A_keys, diag_keys, S);
+    if (m_initial_level > 0) { powerKeys(A, m_initial_level, start_keys); }
+
+    Ops::merge(m_initial_level > 0 ? start_keys : m_A_keys, diag_keys, S);
     patternFromKeys(S, (int) S.size());
     gatherAValues(A);
     initValues();
+
+    // the extra fill starts at zero: one sweep gives it values before the first selection
+    if (m_initial_level > 0) { sweep(); }
     m_counts.resize(n + 1);
     m_cand_ro.resize(n + 1);
 

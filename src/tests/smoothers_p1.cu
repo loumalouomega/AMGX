@@ -586,6 +586,40 @@ void run()
         // The pattern changes with every sweep: from the second sweep on, check the residual against the size of A
         if (sweeps > 1) { UNITTEST_ASSERT_TRUE(ParILU<TConfig>::patternResidual(A, L, U) < 1e-2 * norm_A); }
     }
+
+    // ilut_initial_fill_level = 1 starts from the pattern of A^2: at equal steps it reaches at least the
+    // fill of the A start, within the same row caps and residual bound
+    int nnz[2];
+
+    for (int level = 0; level <= 1; level++)
+    {
+        ParILUFactor<TConfig> factor;
+        factor.setInitialFillLevel(level);
+        Matrix_d L, U;
+        factor.factorThreshold(A, 1e-3, fill, 2, L, U);
+        Matrix_h L_h = L, U_h = U;
+        const Rows Lr = this->rowsOf(L_h), Ur = this->rowsOf(U_h);
+        int violations = 0;
+
+        for (size_t i = 0; i < R.size(); i++)
+        {
+            int lower = 0, upper = 0;
+
+            for (std::map<int, double>::const_iterator it = R[i].begin(); it != R[i].end(); ++it)
+            {
+                if (it->first < (int) i) { lower++; }
+                else if (it->first > (int) i) { upper++; }
+            }
+
+            if ((int) Lr[i].size() > (int)(lower * fill) || (int) Ur[i].size() - 1 > (int)(upper * fill)) { violations++; }
+        }
+
+        UNITTEST_ASSERT_EQUAL(violations, 0);
+        UNITTEST_ASSERT_TRUE(ParILU<TConfig>::patternResidual(A, L, U) < 1e-2 * norm_A);
+        nnz[level] = L.get_num_nz() + U.get_num_nz();
+    }
+
+    UNITTEST_ASSERT_TRUE(nnz[1] >= nnz[0]);
 }
 
 DECLARE_UNITTEST_END(ParILUTSetup)

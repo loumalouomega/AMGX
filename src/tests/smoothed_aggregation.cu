@@ -1160,6 +1160,7 @@ void run()
     const int scalar_rbm = solve(E, false, true);
     const int block_rbm = solve(E, true, true);
     const int block_plain = solve(E, true, false);
+    std::cout << "  iterations: scalar + modes " << scalar_rbm << ", BSR + modes " << block_rbm << ", BSR " << block_plain << std::endl;
     UNITTEST_ASSERT_TRUE(scalar_rbm < 30);
     UNITTEST_ASSERT_TRUE(block_rbm < 40);
     UNITTEST_ASSERT_TRUE(block_rbm < block_plain);

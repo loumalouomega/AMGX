@@ -23,6 +23,11 @@
 #include <thrust_wrapper.h>
 #include <thrust/remove.h>
 #include <thrust/unique.h>
+#include <thrust/binary_search.h>
+#include <thrust/logical.h>
+#ifdef AMGX_WITH_MPI
+#include <mpi.h>
+#endif
 #include <cutil.h>
 #include <util.h>
 
@@ -226,6 +231,112 @@ __global__ void padBlocksKernel(const IndexType *ro, const IndexType *ci, const 
     }
 }
 
+// Scalar index of unknown k of block index i: out[i * b + k] = in[i] * b + k
+template <typename T>
+__global__ void expandBlockIndexKernel(const T *in, int n, int b, T *out)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        for (int k = 0; k < b; k++) { out[(size_t) i * b + k] = in[i] * b + k; }
+}
+
+// Global column of a local column: owned [0, n_owned) from base, the halo through local_to_global
+template <typename IndexType>
+__device__ __forceinline__ int64_t globalColumn(IndexType c, int n_owned, int64_t base, const int64_t *l2g)
+{
+    return c < n_owned ? base + c : l2g[c - n_owned];
+}
+
+// key = local row * num_global + global column of every entry of rows [0, n), with its position
+template <typename IndexType>
+__global__ void entryKeysKernel(const IndexType *ro, const IndexType *ci, int n, int n_owned, int64_t base,
+                                const int64_t *l2g, int64_t num_global, int64_t *keys, int *pos)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        for (IndexType k = ro[i]; k < ro[i + 1]; k++)
+        {
+            keys[k] = (int64_t) i * num_global + globalColumn(ci[k], n_owned, base, l2g);
+
+            if (pos != NULL) { pos[k] = k; }
+        }
+}
+
+// Global row and column of the entries of the external rows [first, last) of R A P (their global
+// row is the global id of the P column they belong to)
+template <typename IndexType>
+__global__ void externalEntriesKernel(const IndexType *ro, const IndexType *ci, int first, int last, int n_owned,
+                                      int64_t base, const int64_t *l2g, int64_t *grow, int64_t *gcol)
+{
+    for (int i = first + blockIdx.x * blockDim.x + threadIdx.x; i < last; i += gridDim.x * blockDim.x)
+        for (IndexType k = ro[i]; k < ro[i + 1]; k++)
+        {
+            grow[k - ro[first]] = l2g[i - n_owned];
+            gcol[k - ro[first]] = globalColumn(ci[k], n_owned, base, l2g);
+        }
+}
+
+// Ac position of each key (sorted Ac keys and their positions); -1 marks a missing key
+__global__ void lookupKeysKernel(const int64_t *keys, int m, const int64_t *ac_keys, const int *ac_pos, int ac_nnz, int *dst)
+{
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < m; e += gridDim.x * blockDim.x)
+    {
+        const int q = lowerBound64(ac_keys, ac_nnz, keys[e]);
+        dst[e] = (q < ac_nnz && ac_keys[q] == keys[e]) ? ac_pos[q] : -1;
+    }
+}
+
+// Keys of received entries: global row to local row
+__global__ void receivedKeysKernel(const int64_t *grow, const int64_t *gcol, int m, int64_t base, int64_t num_global, int64_t *keys)
+{
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < m; e += gridDim.x * blockDim.x)
+    {
+        keys[e] = (grow[e] - base) * num_global + gcol[e];
+    }
+}
+
+template <typename ValueType>
+__global__ void scatterValuesKernel(const ValueType *src, const int *dst, int m, bool add, ValueType *out)
+{
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < m; e += gridDim.x * blockDim.x)
+    {
+        if (add) { out[dst[e]] = out[dst[e]] + src[e]; }
+        else { out[dst[e]] = src[e]; }
+    }
+}
+
+struct is_negative
+{
+    __host__ __device__ bool operator()(int x) const { return x < 0; }
+};
+
+#ifdef AMGX_WITH_MPI
+// Point-to-point exchange of one host buffer per neighbour (sizes known on both sides)
+template <typename T>
+void exchangeWithNeighbours(MPI_Comm comm, const std::vector<int> &neighbors, std::vector<std::vector<T> > &send,
+                            std::vector<std::vector<T> > &recv, int tag)
+{
+    std::vector<MPI_Request> requests;
+
+    for (size_t i = 0; i < neighbors.size(); i++)
+    {
+        MPI_Request r;
+
+        if (!recv[i].empty())
+        {
+            MPI_Irecv(&recv[i][0], (int)(recv[i].size() * sizeof(T)), MPI_BYTE, neighbors[i], tag, comm, &r);
+            requests.push_back(r);
+        }
+
+        if (!send[i].empty())
+        {
+            MPI_Isend(&send[i][0], (int)(send[i].size() * sizeof(T)), MPI_BYTE, neighbors[i], tag, comm, &r);
+            requests.push_back(r);
+        }
+    }
+
+    if (!requests.empty()) { MPI_Waitall((int) requests.size(), &requests[0], MPI_STATUSES_IGNORE); }
+}
+#endif
+
 struct halo_column
 {
     int64_t base, end;
@@ -237,7 +348,7 @@ struct halo_column
 
 template <class T_Config>
 SA_AMG_Level_Base<T_Config>::SA_AMG_Level_Base(AMG_Class *amg, ThreadManager *tmng)
-    : AMG_Level<T_Config>(amg, tmng), m_use_scalar_copy(false), m_block_size(1), m_inherited_block_size(0),
+    : AMG_Level<T_Config>(amg, tmng), m_use_scalar_copy(false), m_coarse_refilled(false), m_block_size(1), m_inherited_block_size(0),
       m_nullspace_cols(0), m_num_aggregates(0), m_num_removed(0), m_num_coarse_vertices(0),
       m_level_eps(0.0), m_rho(0.0), m_omega(0.0)
 {
@@ -259,10 +370,9 @@ void SA_AMG_Level_Base<T_Config>::createCoarseVertices()
     Matrix<TConfig> &A = this->getA();
     const bool distributed = isDistributed();
 
-    if (distributed && (A.get_block_dimy() > 1 || A.hasProps(DIAG)))
+    if (distributed && A.hasProps(DIAG))
     {
-        FatalError("Distributed SMOOTHED_AGGREGATION needs a scalar matrix without external diagonal: upload systems as "
-                   "scalar rows with aggregation_block_size", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+        FatalError("Distributed SMOOTHED_AGGREGATION does not support an external diagonal", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
     }
 
     if (distributed) { A.setView(OWNED); }
@@ -304,13 +414,14 @@ void SA_AMG_Level_Base<T_Config>::createCoarseVertices()
                        AMGX_ERR_BAD_PARAMETERS);
         }
 
-        // The user's rows were renumbered into [interior | boundary] at upload: the nullspace follows,
-        // and the unknowns of a node must stay consecutive for the pointwise aggregation
+        // The user's (block) rows were renumbered into [interior | boundary] at upload: the nullspace
+        // follows, and the interleaved unknowns of a node must stay consecutive for the pointwise
+        // aggregation (BSR blocks are never split)
         const int n = A.get_num_rows();
 
         if (distributed && (int) A.manager->renumbering.size() >= n && n > 0)
         {
-            if (m_block_size > 1)
+            if (m_block_size > 1 && A.get_block_dimy() == 1)
             {
                 IVector bad(1, 0);
                 nodeContiguityKernel <<< salNumBlocks(n / m_block_size), SAL_BLOCK_SIZE>>>(A.manager->renumbering.raw(),
@@ -327,8 +438,8 @@ void SA_AMG_Level_Base<T_Config>::createCoarseVertices()
             if (m_nullspace_cols > 0)
             {
                 DVector permuted(m_nullspace.size());
-                permuteRowsKernel <<< salNumBlocks(n), SAL_BLOCK_SIZE>>>(A.manager->renumbering.raw(), n, m_nullspace_cols,
-                        m_nullspace.raw(), permuted.raw());
+                permuteRowsKernel <<< salNumBlocks(n), SAL_BLOCK_SIZE>>>(A.manager->renumbering.raw(), n,
+                        A.get_block_dimy() * m_nullspace_cols, m_nullspace.raw(), permuted.raw());
                 cudaCheckError();
                 m_nullspace.swap(permuted);
             }
@@ -381,7 +492,14 @@ void SA_AMG_Level_Base<T_Config>::createCoarseMatrices()
     AMG_Level<TConfig> *next = this->getNextLevel(typename Matrix<TConfig>::memory_space());
     Matrix<TConfig> &Ac = next->getA();
 
-    if (distributed) { renumberCoarseLevel(); }
+    if (distributed && !m_coarse_refilled)
+    {
+        renumberCoarseLevel();
+        finishDistributedCoarseLevel();
+    }
+
+    m_coarse_refilled = false;
+
 
     Ac.copyAuxData(&this->getA());
 
@@ -415,11 +533,12 @@ void SA_AMG_Level_Base<T_Config>::createCoarseMatrices()
 template <class T_Config>
 void SA_AMG_Level_Base<T_Config>::renumberCoarseLevel()
 {
-    Matrix<TConfig> &A = this->getA();
+    nvtxRange nr("sa_coarse_renumber");
     Matrix<TConfig> &Ac = this->getNextLevel(typename Matrix<TConfig>::memory_space())->getA();
     Ac.set_initialized(0);
     Ac.manager->renumberMatrixOneRing(this->isReuseLevel());
-    Ac.manager->renumber_P_R(P, R, A);
+    // P's fine rows are those of the scalar matrix
+    Ac.manager->renumber_P_R(P, R, scalarA());
     Ac.manager->createOneRingHaloRows();
     Ac.manager->getComms()->set_neighbors(Ac.manager->num_neighbors());
     Ac.setView(OWNED);
@@ -549,6 +668,7 @@ void SA_AMG_Level_Base<T_Config>::prolongateAndApplyCorrection(VVector &e, VVect
     {
         int owned_offset;
         P.manager->getOffsetAndSizeForView(OWNED, &owned_offset, &owned_size);
+        owned_size /= x.get_block_size();   // P's rows are scalar
     }
 
     axpby(x, tmp, x, ValueTypeB(1), ValueTypeB(1), 0, owned_size);
@@ -621,6 +741,8 @@ void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
     if (this->m_use_scalar_copy)
     {
         PointwiseAggregation<TConfig>::blockToScalar(A, this->m_A_scalar);
+
+        if (this->isDistributed()) { attachScalarManager(); }
     }
 
     const Matrix<TConfig> &As = this->scalarA();
@@ -755,6 +877,60 @@ void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
     this->Profile.toc("computeP");
 }
 
+// Manager of the scalar copy of a distributed BSR matrix: every block row i of A becomes the scalar
+// rows i * b .. i * b + b - 1, so the B2L maps, halo offsets, partition offsets, global ids and the
+// renumbering of A's manager are expanded by b (createTempManager does the maps and offsets)
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::attachScalarManager()
+{
+    typedef typename Base::IVector IVector;
+    Matrix<TConfig> &A = this->getA();
+    Matrix<TConfig> &As = this->m_A_scalar;
+    const int b = A.get_block_dimy();
+    int offset, full;
+    A.getOffsetAndSizeForView(FULL, &offset, &full);
+    IVector row_offsets(full + 1);
+    amgx::thrust::sequence(row_offsets.begin(), row_offsets.end(), 0, b);
+    cudaCheckError();
+    As.set_initialized(0);
+    DistributedArranger<TConfig> prep;
+    prep.createTempManager(As, A, row_offsets);
+    DistributedManager<TConfig> &m = *As.manager;
+    const DistributedManager<TConfig> &a = *A.manager;
+    m.set_num_halo_rings(1);
+    m.part_offsets_h = a.part_offsets_h;
+
+    for (int p = 0; p < (int) m.part_offsets_h.size(); p++) { m.part_offsets_h[p] *= b; }
+
+    m.part_offsets = m.part_offsets_h;
+    m.halo_ranges_h = a.halo_ranges_h;   // [first, end) of each neighbour's rows
+
+    for (int p = 0; p < (int) m.halo_ranges_h.size(); p++) { m.halo_ranges_h[p] *= b; }
+
+    m.halo_ranges = m.halo_ranges_h;
+    m.set_base_index(a.base_index() * b);
+    m.set_index_range(a.index_range() * b);
+    m.num_rows_global = a.num_rows_global * b;
+    m.local_to_global_map.resize(a.local_to_global_map.size() * b);
+    m.renumbering.resize(a.renumbering.size() * b);
+    m.inverse_renumbering.resize(a.inverse_renumbering.size() * b);
+#define AMGX_SAL_EXPAND(SRC, DST) if (SRC.size() > 0) { \
+        expandBlockIndexKernel <<< salNumBlocks(SRC.size()), SAL_BLOCK_SIZE>>>(SRC.raw(), (int) SRC.size(), b, DST.raw()); \
+        cudaCheckError(); }
+    AMGX_SAL_EXPAND(a.local_to_global_map, m.local_to_global_map)
+    AMGX_SAL_EXPAND(a.renumbering, m.renumbering)
+    AMGX_SAL_EXPAND(a.inverse_renumbering, m.inverse_renumbering)
+#undef AMGX_SAL_EXPAND
+    // The copy holds the owned rows only (the halo is in its columns)
+    int interior_offset, interior;
+    A.getOffsetAndSizeForView(INTERIOR, &interior_offset, &interior);
+    const int rows = As.get_num_rows(), nnz = As.get_num_nz();
+    const int nnz_interior = As.row_offsets[interior * b];
+    m.setViewSizes(interior * b, nnz_interior, rows, nnz, full * b, nnz, rows, nnz);
+    As.set_initialized(1);
+    As.setView(OWNED);
+}
+
 // Distributed prolongator. Aggregates are rank-local, so the tentative rows of the halo nodes carry
 // only the neighbours' coarse columns: they are exchanged at a fixed width W (global columns and
 // values, plus the coarse nullspace rows of their columns for the truncation), P_tent is extended to
@@ -771,7 +947,7 @@ void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
     typedef typename Base::IVector IVector;
     typedef typename Base::ValueTypeA ValueTypeA;
     typedef typename Base::IndexType IndexType;
-    Matrix<TConfig> &A = this->getA();
+    Matrix<TConfig> &A = this->scalarA();
     Matrix<TConfig> &P = this->P;
     const int K = this->m_nullspace_cols;
     const int CB = (K > 0 || this->m_block_size > 1) ? this->coarseBlockSize() : 0;
@@ -944,6 +1120,260 @@ void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
     P.set_initialized(1);
 }
 
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::~SA_AMG_Level()
+{
+#ifdef AMGX_WITH_MPI
+    if (m_refill_comm != NULL)
+    {
+        int finalized = 0;
+        MPI_Finalized(&finalized);
+
+        if (!finalized) { MPI_Comm_free((MPI_Comm *) m_refill_comm); }
+
+        delete (MPI_Comm *) m_refill_comm;
+    }
+#endif
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+bool SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::sameRefillPattern(const Matrix<TConfig> &A) const
+{
+    const int rows = A.get_num_rows();
+
+    if ((int) m_refill_a_ro.size() != rows + 1 ||
+            !amgx::thrust::equal(A.row_offsets.begin(), A.row_offsets.begin() + rows + 1, m_refill_a_ro.begin()))
+    {
+        return false;
+    }
+
+    const int nnz = A.row_offsets[rows];
+    return nnz == 0 || amgx::thrust::equal(A.col_indices.begin(), A.col_indices.begin() + nnz, m_refill_a_ci.begin());
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::finishDistributedCoarseLevel()
+{
+    if (m_capture && m_captured)
+    {
+        buildDistributedRefill();
+    }
+
+    m_capture = false;
+    m_captured = false;
+}
+
+// Records the numeric-only rebuild of a distributed Ac once a full rebuild left the coarse numbering
+// unchanged (from the second setup on): then P and R are those the captured exchange saw, and the
+// owned coarse rows keep their global ids. Every contribution to Ac is located by its key (local row,
+// global column): the owned rows of R A P_ext directly, the external rows on the neighbour that owns
+// them (their keys are exchanged once). A rank whose record fails just keeps rebuilding fully, and the
+// global check in computeAOperator then makes all ranks do so.
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::buildDistributedRefill()
+{
+#ifdef AMGX_WITH_MPI
+    typedef Vector<typename TConfig::template setVecPrec<AMGX_vecInt64>::Type> I64Vector;
+    typedef typename Base::IVector IVector;
+    nvtxRange nr("sa_refill_build");
+    m_refill_ready = false;
+    Matrix<TConfig> &A = this->scalarA();
+    Matrix<TConfig> &Ac = this->getNextLevel(typename Matrix<TConfig>::memory_space())->getA();
+    const int n_owned = Ac.manager->halo_offsets[0];
+    const int nc = m_cap_halo_offsets.empty() ? 0 : m_cap_halo_offsets[0];
+    const int64_t base = Ac.manager->base_index(), num_global = Ac.manager->num_rows_global;
+
+    // Its own communicator: AMGX keeps receives posted on the level's one, which could match these messages
+    if (m_refill_comm == NULL)
+    {
+        m_refill_comm = new MPI_Comm;
+        MPI_Comm_dup(A.manager->getComms()->get_mpi_comm(), (MPI_Comm *) m_refill_comm);
+    }
+
+    MPI_Comm comm = *(MPI_Comm *) m_refill_comm;
+    // The owned coarse rows were not moved (and the keys fit); decided together, the exchanges below
+    // involve the neighbours
+    int ok = nc == n_owned && (int) Ac.manager->renumbering.size() >= n_owned &&
+             (num_global == 0 || (int64_t) std::max(n_owned, 1) <= INT64_MAX / num_global);
+
+    if (ok && n_owned > 0)
+    {
+        ok = amgx::thrust::equal(Ac.manager->renumbering.begin(), Ac.manager->renumbering.begin() + n_owned,
+                                 amgx::thrust::counting_iterator<int>(0));
+    }
+
+    int all_ok = 0;
+    MPI_Allreduce(&ok, &all_ok, 1, MPI_INT, MPI_MIN, comm);
+
+    if (!all_ok) { return; }
+
+    // R (A P_ext) with sorted patterns
+    m_RAP_full = Matrix<TConfig>();
+    m_dist_galerkin.build(this->R, A, m_P_ext, m_RAP_full, this->amg->getCsrWorkspace());
+    // the values of A may change, not its arrays: a coarse A rebuilt in full can come back reordered
+    const int a_rows = A.get_num_rows(), a_nnz = A.row_offsets[a_rows];
+    m_refill_a_ro.resize(a_rows + 1);
+    m_refill_a_ci.resize(std::max(a_nnz, 1));
+    thrust_wrapper::copy<AMGX_device>(A.row_offsets.begin(), A.row_offsets.begin() + a_rows + 1, m_refill_a_ro.begin());
+    thrust_wrapper::copy<AMGX_device>(A.col_indices.begin(), A.col_indices.begin() + a_nnz, m_refill_a_ci.begin());
+    // Ac's owned entries, sorted by key
+    const int ac_nnz = Ac.row_offsets[n_owned];
+    I64Vector ac_keys(std::max(ac_nnz, 1));
+    IVector ac_pos(std::max(ac_nnz, 1));
+
+    if (n_owned > 0)
+    {
+        entryKeysKernel <<< salNumBlocks(n_owned), SAL_BLOCK_SIZE>>>(Ac.row_offsets.raw(), Ac.col_indices.raw(), n_owned, n_owned,
+                base, Ac.manager->local_to_global_map.raw(), num_global, ac_keys.raw(), ac_pos.raw());
+        cudaCheckError();
+    }
+
+    amgx::thrust::sort_by_key(ac_keys.begin(), ac_keys.begin() + ac_nnz, ac_pos.begin());
+    cudaCheckError();
+    // Owned rows of R A P_ext
+    const int own_nnz = m_RAP_full.row_offsets[nc];
+    I64Vector keys(std::max(own_nnz, 1));
+    m_own_dst.resize(std::max(own_nnz, 1));
+    int failed = 0;
+
+    if (nc > 0)
+    {
+        entryKeysKernel <<< salNumBlocks(nc), SAL_BLOCK_SIZE>>>(m_RAP_full.row_offsets.raw(), m_RAP_full.col_indices.raw(), nc, nc,
+                base, m_cap_l2g.raw(), num_global, keys.raw(), (int *) NULL);
+        lookupKeysKernel <<< salNumBlocks(own_nnz), SAL_BLOCK_SIZE>>>(keys.raw(), own_nnz, ac_keys.raw(), ac_pos.raw(), ac_nnz,
+                m_own_dst.raw());
+        cudaCheckError();
+        failed |= amgx::thrust::any_of(m_own_dst.begin(), m_own_dst.begin() + own_nnz, is_negative());
+    }
+
+    // External rows: slices sent to each neighbour, with their keys once
+    const int nn = m_cap_neighbors.size();
+    m_xchg_neighbors = m_cap_neighbors;
+    m_send_begin.assign(nn, 0);
+    m_send_end.assign(nn, 0);
+    m_recv_count.assign(nn, 0);
+    std::vector<std::vector<int> > send_count(nn, std::vector<int>(1)), recv_count(nn, std::vector<int>(1));
+    std::vector<std::vector<int64_t> > send_keys(nn), recv_keys(nn);
+
+    for (int i = 0; i < nn; i++)
+    {
+        const int first = m_cap_halo_offsets[i], last = m_cap_halo_offsets[i + 1];
+        m_send_begin[i] = m_RAP_full.row_offsets[first];
+        m_send_end[i] = m_RAP_full.row_offsets[last];
+        const int m = m_send_end[i] - m_send_begin[i];
+        send_count[i][0] = m;
+
+        if (m > 0)
+        {
+            I64Vector grow(m), gcol(m);
+            externalEntriesKernel <<< salNumBlocks(last - first), SAL_BLOCK_SIZE>>>(m_RAP_full.row_offsets.raw(),
+                    m_RAP_full.col_indices.raw(), first, last, nc, base, m_cap_l2g.raw(), grow.raw(), gcol.raw());
+            cudaCheckError();
+            send_keys[i].resize(2 * m);
+            amgx::thrust::copy(grow.begin(), grow.end(), send_keys[i].begin());
+            amgx::thrust::copy(gcol.begin(), gcol.end(), send_keys[i].begin() + m);
+        }
+    }
+
+    exchangeWithNeighbours(comm, m_xchg_neighbors, send_count, recv_count, 7731);
+    int total_recv = 0;
+
+    for (int i = 0; i < nn; i++)
+    {
+        m_recv_count[i] = recv_count[i][0];
+        recv_keys[i].resize(2 * m_recv_count[i]);
+        total_recv += m_recv_count[i];
+    }
+
+    exchangeWithNeighbours(comm, m_xchg_neighbors, send_keys, recv_keys, 7732);
+    m_recv_dst.resize(std::max(total_recv, 1));
+
+    for (int i = 0, offset = 0; i < nn; offset += m_recv_count[i], i++)
+    {
+        const int m = m_recv_count[i];
+
+        if (m == 0) { continue; }
+
+        I64Vector grow(m), gcol(m), rkeys(m);
+        amgx::thrust::copy(recv_keys[i].begin(), recv_keys[i].begin() + m, grow.begin());
+        amgx::thrust::copy(recv_keys[i].begin() + m, recv_keys[i].end(), gcol.begin());
+        receivedKeysKernel <<< salNumBlocks(m), SAL_BLOCK_SIZE>>>(grow.raw(), gcol.raw(), m, base, num_global, rkeys.raw());
+        lookupKeysKernel <<< salNumBlocks(m), SAL_BLOCK_SIZE>>>(rkeys.raw(), m, ac_keys.raw(), ac_pos.raw(), ac_nnz,
+                m_recv_dst.raw() + offset);
+        cudaCheckError();
+        failed |= amgx::thrust::any_of(m_recv_dst.begin() + offset, m_recv_dst.begin() + offset + m, is_negative());
+    }
+
+    m_refill_ready = failed == 0;
+#endif
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::refillDistributed()
+{
+#ifdef AMGX_WITH_MPI
+    typedef typename Base::MVector MVector;
+    typedef typename Base::ValueTypeA ValueTypeA;
+    nvtxRange nr("sa_refill");
+    Matrix<TConfig> &A = this->scalarA();
+    Matrix<TConfig> &Ac = this->getNextLevel(typename Matrix<TConfig>::memory_space())->getA();
+    A.setView(OWNED);
+
+    if (!m_dist_galerkin.refill(this->R, A, m_P_ext, m_RAP_full))
+    {
+        FatalError("Distributed SMOOTHED_AGGREGATION: numeric rebuild on changed patterns", AMGX_ERR_INTERNAL);
+    }
+
+    const int nc = m_RAP_full.row_offsets.size() > 1 ? Ac.manager->halo_offsets[0] : 0;
+    const int own_nnz = m_RAP_full.row_offsets[nc];
+    // external rows' values to their owners
+    const int nn = m_xchg_neighbors.size();
+    std::vector<std::vector<ValueTypeA> > send(nn), recv(nn);
+
+    for (int i = 0; i < nn; i++)
+    {
+        send[i].resize(m_send_end[i] - m_send_begin[i]);
+
+        if (!send[i].empty())
+        {
+            amgx::thrust::copy(m_RAP_full.values.begin() + m_send_begin[i], m_RAP_full.values.begin() + m_send_end[i], send[i].begin());
+        }
+
+        recv[i].resize(m_recv_count[i]);
+    }
+
+    cudaCheckError();
+    exchangeWithNeighbours(*(MPI_Comm *) m_refill_comm, m_xchg_neighbors, send, recv, 7733);
+    // The owned rows of Ac are zeroed, the owned contributions (unique positions) written, the received
+    // ones added neighbour by neighbour (deterministic order). Ac's halo rows are not touched.
+    Ac.set_initialized(0);
+    thrust_wrapper::fill<AMGX_device>(Ac.values.begin(), Ac.values.begin() + Ac.row_offsets[nc], ValueTypeA(0));
+    cudaCheckError();
+
+    if (own_nnz > 0)
+    {
+        scatterValuesKernel <<< salNumBlocks(own_nnz), SAL_BLOCK_SIZE>>>(m_RAP_full.values.raw(), m_own_dst.raw(), own_nnz, false,
+                Ac.values.raw());
+        cudaCheckError();
+    }
+
+    for (int i = 0, offset = 0; i < nn; offset += m_recv_count[i], i++)
+    {
+        const int m = m_recv_count[i];
+
+        if (m == 0) { continue; }
+
+        MVector vals(m);
+        amgx::thrust::copy(recv[i].begin(), recv[i].end(), vals.begin());
+        scatterValuesKernel <<< salNumBlocks(m), SAL_BLOCK_SIZE>>>(vals.raw(), m_recv_dst.raw() + offset, m, true, Ac.values.raw());
+        cudaCheckError();
+    }
+
+    Ac.computeDiagonal();
+    Ac.set_initialized(1);
+#endif
+}
+
 // Numeric-only Galerkin rebuild: on with structure reuse, single GPU, unless numeric_rebuild=0
 template <class TConfig>
 static bool useNumericGalerkin(AMG_Config *cfg, const std::string &scope, const Matrix<TConfig> &A)
@@ -969,8 +1399,12 @@ void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
     // On reuse levels the coefficients of A changed since the scalar copy was made (or it was freed)
     if (A.get_block_dimy() > 1 || A.hasProps(DIAG))
     {
+        if (this->isDistributed()) { A.setView(OWNED); }
+
         PointwiseAggregation<TConfig>::blockToScalar(A, this->m_A_scalar);
         this->m_use_scalar_copy = true;
+
+        if (this->isDistributed()) { attachScalarManager(); }
     }
 
     Ac.set_initialized(0);
@@ -980,6 +1414,25 @@ void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
 
     if (this->isDistributed())
     {
+        // Numeric-only rebuild when every rank has a valid record (ranks must take the same path)
+        const bool enabled = this->amg->m_cfg->AMG_Config::template getParameter<int>("structure_reuse_levels", this->amg->m_cfg_scope) != 0 &&
+                             this->amg->m_cfg->AMG_Config::template getParameter<int>("numeric_rebuild", this->amg->m_cfg_scope) != 0;
+        int not_ready = (enabled && this->isReuseLevel() && m_refill_ready && sameRefillPattern(this->scalarA())) ? 0 : 1;
+        A.manager->global_reduce_sum(&not_ready);
+
+        if (not_ready == 0)
+        {
+            refillDistributed();
+            this->m_coarse_refilled = true;
+            Ac.set_initialized(1);
+            this->Profile.toc("computeA");
+            return;
+        }
+
+        // recorded on reuse levels only: a first setup's coarse matrices come back reordered anyway
+        m_refill_ready = false;
+        m_capture = enabled && this->isReuseLevel();
+        m_captured = false;
         computeAOperatorDistributed(wk);
         this->Profile.toc("computeA");
         return;
@@ -1015,6 +1468,7 @@ void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
 void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::computeAOperatorDistributed(void *wk)
 {
+    nvtxRange nr("sa_distributed_galerkin");
     typedef typename TConfig::template setVecPrec<AMGX_vecInt64>::Type TConfig64;
     typedef Vector<TConfig64> I64Vector;
     typedef typename TConfig::template setMemSpace<AMGX_host>::Type TConfig_h;
@@ -1023,7 +1477,7 @@ void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
     typedef Vector<TConfigI_h> IVector_h;
     typedef Vector<TConfig64_h> I64Vector_h;
     typedef typename Base::IVector IVector;
-    Matrix<TConfig> &A = this->getA();
+    Matrix<TConfig> &A = this->scalarA();
     Matrix<TConfig> &P = this->P;
     Matrix<TConfig> &RAP = this->getNextLevel(typename Matrix<TConfig>::memory_space())->getA();
     const int num_parts = A.manager->get_num_partitions();
@@ -1054,6 +1508,24 @@ void SA_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >
                               P_halo_offsets, RAP.manager->part_offsets_h, RAP.manager->part_offsets, num_owned_coarse_pts,
                               RAP.manager->part_offsets_h[my_rank]);
     cudaCheckError();
+
+    // For a later numeric-only rebuild: P with its halo rows, who gets which rows of R A P, global ids
+    if (m_capture)
+    {
+        const int rows = P.row_offsets.size() - 1, nnz = P.row_offsets[rows];
+        m_P_ext = Matrix<TConfig>();
+        m_P_ext.addProps(CSR);
+        m_P_ext.resize(rows, P.get_num_cols(), nnz, 1, 1, 1);
+        thrust_wrapper::copy<AMGX_device>(P.row_offsets.begin(), P.row_offsets.end(), m_P_ext.row_offsets.begin());
+        thrust_wrapper::copy<AMGX_device>(P.col_indices.begin(), P.col_indices.begin() + nnz, m_P_ext.col_indices.begin());
+        thrust_wrapper::copy<AMGX_device>(P.values.begin(), P.values.begin() + nnz, m_P_ext.values.begin());
+        m_P_ext.set_initialized(1);
+        m_cap_neighbors.assign(P_neighbors.begin(), P_neighbors.end());
+        m_cap_halo_offsets.assign(P_halo_offsets.begin(), P_halo_offsets.end());
+        m_cap_l2g = RAP.manager->local_to_global_map;
+        m_captured = true;
+    }
+
     // The Galerkin product sees the owned fine rows of P
     P.set_initialized(0);
     P.set_num_rows(num_owned_fine_pts);

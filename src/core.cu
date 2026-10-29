@@ -435,6 +435,7 @@ inline void registerParameters()
     AMG_Config::registerParameter<double>("ilut_fill_factor", "ILUT: keep at most ilut_fill_factor * nnz(lower/upper part of a_i) entries per factor row", 2.0, 0.0, 1e6);
     AMG_Config::registerParameter<int>("ilup_fill_level", "ILUP: incomplete LU on the pattern of A^(ilup_fill_level+1), 0 is ILU(0)", 1, 0, 10);
     AMG_Config::registerParameter<int>("ilu_factor_sweeps", "ILUT/ILUP: number of parallel fixed-point sweeps of the factorization, -1 for the variant default (ILUP 30, ILUT 10)", -1, -1, 1000);
+    AMG_Config::registerParameter<int>("ilut_initial_fill_level", "ILUT: ParILUT starts from the pattern of A^(ilut_initial_fill_level+1), 0 is the pattern of A", 0, 0, 10);
     std::vector<std::string> ilu_solve_values;
     ilu_solve_values.push_back("JACOBI");
     ilu_solve_values.push_back("CUSPARSE");
